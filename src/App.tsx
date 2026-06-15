@@ -1,11 +1,18 @@
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react';
+import * as pdfjsLib from 'pdfjs-dist';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
 import './App.css';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 type OptionKey = 'A' | 'B' | 'C' | 'D';
 type Screen = 'paste' | 'quiz' | 'results';
 type ReviewStatus = 'correct' | 'incorrect' | 'not-attempted';
 type ResultFilter = 'all' | ReviewStatus;
 type TimerMode = 'per-question' | 'full-test';
+type AiImportTask = 'extract-paper' | 'generate-from-lecture';
+type QuestionSource = 'manual' | 'paper-ai' | 'lecture-ai' | 'chatgpt';
+type PdfExtractionStatus = 'idle' | 'extracting' | 'formatting' | 'ready' | 'error';
 
 type Question = {
   id: string;
@@ -37,10 +44,25 @@ type QuizSession = {
   completedAt?: number;
 };
 
+type PdfExtractionState = {
+  status: PdfExtractionStatus;
+  message: string;
+  fileName?: string;
+};
+
 const STORAGE_KEY = 'entry-test-quiz-session';
 const LEGACY_STORAGE_KEY = 'hat-quick-quiz-session';
 const DEFAULT_PER_QUESTION_SECONDS = 60;
 const DEFAULT_FULL_TEST_SECONDS = 30 * 60;
+const MAX_PDF_BYTES = 8 * 1024 * 1024;
+const MAX_PDF_PAGES = 10;
+const MAX_IMAGE_FILES = 10;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_LONG_EDGE = 1600;
+const MIN_TEXT_EXTRACTION_CHARS = 120;
+const MIN_LECTURE_QUESTION_COUNT = 5;
+const MAX_LECTURE_QUESTION_COUNT = 50;
+const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const PER_QUESTION_OPTIONS = [30, 45, 60, 90, 120];
 const FULL_TEST_OPTIONS = [5, 10, 15, 30, 45, 60].map((minutes) => minutes * 60);
 const NO_EXPLANATION_TEXT = 'No explanation was added for this question.';
@@ -362,6 +384,119 @@ function formatTimerClock(seconds: number) {
   return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
 
+function getPdfTextItemText(item: unknown) {
+  if (typeof item === 'object' && item !== null && 'str' in item) {
+    return String((item as { str?: unknown }).str ?? '');
+  }
+
+  return '';
+}
+
+async function renderPdfPageToImage(page: pdfjsLib.PDFPageProxy) {
+  const viewport = page.getViewport({ scale: 1.45 });
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+
+  if (!context) {
+    throw new Error('Your browser could not prepare the PDF page for AI extraction.');
+  }
+
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+
+  await page.render({ canvasContext: context, viewport }).promise;
+  return canvas.toDataURL('image/jpeg', 0.72);
+}
+
+async function extractPdfForAi(file: File) {
+  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+
+  if (pdf.numPages > MAX_PDF_PAGES) {
+    throw new Error(`This PDF has ${pdf.numPages} pages. Please upload ${MAX_PDF_PAGES} pages or fewer for this version.`);
+  }
+
+  const textParts: string[] = [];
+  const pages: pdfjsLib.PDFPageProxy[] = [];
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    pages.push(page);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items.map(getPdfTextItemText).filter(Boolean).join(' ');
+    if (pageText.trim()) {
+      textParts.push(`Page ${pageNumber}\n${pageText.trim()}`);
+    }
+  }
+
+  const extractedText = textParts.join('\n\n').trim();
+
+  if (extractedText.length >= MIN_TEXT_EXTRACTION_CHARS) {
+    return { sourceType: 'text' as const, text: extractedText, pageCount: pdf.numPages };
+  }
+
+  const images: string[] = [];
+  for (const page of pages) {
+    images.push(await renderPdfPageToImage(page));
+  }
+
+  return { sourceType: 'images' as const, images, pageCount: pdf.numPages };
+}
+
+function isSupportedImage(file: File) {
+  return ACCEPTED_IMAGE_TYPES.includes(file.type);
+}
+
+async function imageFileToDataUrl(file: File) {
+  const sourceUrl = URL.createObjectURL(file);
+
+  try {
+    const image = new Image();
+    image.decoding = 'async';
+    const loaded = new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error(`Could not read ${file.name}. Please try a clearer JPG, PNG, or WebP image.`));
+    });
+    image.src = sourceUrl;
+    await loaded;
+
+    const scale = Math.min(1, MAX_IMAGE_LONG_EDGE / Math.max(image.naturalWidth, image.naturalHeight));
+    const width = Math.max(1, Math.round(image.naturalWidth * scale));
+    const height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+
+    if (!context) {
+      throw new Error('Your browser could not prepare this image for AI extraction.');
+    }
+
+    canvas.width = width;
+    canvas.height = height;
+    context.drawImage(image, 0, 0, width, height);
+    return canvas.toDataURL('image/jpeg', 0.78);
+  } finally {
+    URL.revokeObjectURL(sourceUrl);
+  }
+}
+
+async function extractImagesForAi(files: File[]) {
+  if (files.length > MAX_IMAGE_FILES) {
+    throw new Error(`Please upload ${MAX_IMAGE_FILES} images or fewer.`);
+  }
+
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+  if (totalBytes > MAX_IMAGE_BYTES) {
+    throw new Error(`These images are too large. Please upload images under ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB total.`);
+  }
+
+  const unsupportedFile = files.find((file) => !isSupportedImage(file));
+  if (unsupportedFile) {
+    throw new Error(`${unsupportedFile.name} is not supported. Please upload JPG, PNG, or WebP images.`);
+  }
+
+  const images = await Promise.all(files.map(imageFileToDataUrl));
+  return { sourceType: 'images' as const, images, pageCount: files.length };
+}
+
 function getStatusLabel(status: ReviewStatus) {
   if (status === 'correct') {
     return 'Correct';
@@ -374,10 +509,47 @@ function getStatusLabel(status: ReviewStatus) {
   return 'Not Attempted';
 }
 
+function getAiImportIdleMessage(task: AiImportTask) {
+  return task === 'generate-from-lecture'
+    ? 'Upload lecture slides and choose how many MCQs Gemini should generate from the slide content only.'
+    : 'Upload a PDF, paper photo, or screenshot and let AI convert it into quiz-ready MCQs.';
+}
+
+function getAiImportFileLabel(files: File[]) {
+  if (files.length === 1) {
+    return files[0].name;
+  }
+
+  return `${files.length} images selected`;
+}
+
+function getQuestionSourceLabel(source: QuestionSource) {
+  if (source === 'paper-ai') {
+    return 'AI paper import';
+  }
+
+  if (source === 'lecture-ai') {
+    return 'Lecture slides';
+  }
+
+  if (source === 'chatgpt') {
+    return 'ChatGPT prompt';
+  }
+
+  return 'Manual paste';
+}
+
 function App() {
   const [pasteText, setPasteText] = useState('');
   const [parseErrors, setParseErrors] = useState<string[]>([]);
   const [promptCopyMessage, setPromptCopyMessage] = useState('');
+  const [questionSource, setQuestionSource] = useState<QuestionSource>('manual');
+  const [aiImportTask, setAiImportTask] = useState<AiImportTask>('extract-paper');
+  const [lectureQuestionCount, setLectureQuestionCount] = useState(10);
+  const [pdfExtraction, setPdfExtraction] = useState<PdfExtractionState>({
+    status: 'idle',
+    message: getAiImportIdleMessage('extract-paper'),
+  });
   const [selectedTimerMode, setSelectedTimerMode] = useState<TimerMode>('per-question');
   const [selectedPerQuestionSeconds, setSelectedPerQuestionSeconds] = useState(DEFAULT_PER_QUESTION_SECONDS);
   const [selectedFullTestSeconds, setSelectedFullTestSeconds] = useState(DEFAULT_FULL_TEST_SECONDS);
@@ -389,6 +561,7 @@ function App() {
   const autoAdvancedQuestionRef = useRef<string | null>(null);
   const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const fullTestSubmittedRef = useRef(false);
+  const pdfInputRef = useRef<HTMLInputElement | null>(null);
 
   const screen = session?.screen ?? 'paste';
   const currentQuestion = session ? getActiveQuestion(session) : undefined;
@@ -433,6 +606,18 @@ function App() {
         session.questions.length) *
       100
     : 0;
+
+  const questionPreview = useMemo(() => parseQuestions(pasteText), [pasteText]);
+  const hasQuestionInput = pasteText.trim().length > 0;
+  const validationLabel = !hasQuestionInput
+    ? 'Waiting for questions'
+    : questionPreview.errors.length === 0
+      ? 'Ready to start'
+      : `${questionPreview.errors.length} issue${questionPreview.errors.length === 1 ? '' : 's'} to fix`;
+  const selectedTimerLabel =
+    selectedTimerMode === 'per-question'
+      ? `${selectedPerQuestionSeconds} sec per question`
+      : `${Math.round(selectedFullTestSeconds / 60)} min full test`;
 
   const score = useMemo(() => {
     if (!session) {
@@ -613,6 +798,161 @@ function App() {
     }
 
     setPromptCopyMessage('Prompt copied. Send it to ChatGPT to generate your MCQs.');
+  }
+
+  function chooseQuestionSource(source: QuestionSource) {
+    setQuestionSource(source);
+
+    if (source === 'paper-ai') {
+      setAiImportTask('extract-paper');
+      setPdfExtraction({
+        status: 'idle',
+        message: getAiImportIdleMessage('extract-paper'),
+      });
+    }
+
+    if (source === 'lecture-ai') {
+      setAiImportTask('generate-from-lecture');
+      setPdfExtraction({
+        status: 'idle',
+        message: getAiImportIdleMessage('generate-from-lecture'),
+      });
+    }
+  }
+
+  function loadSampleQuestions() {
+    chooseQuestionSource('manual');
+    setPasteText(sampleQuestions);
+    setParseErrors([]);
+  }
+
+  async function handlePaperUpload(fileList: FileList | null) {
+    const files = Array.from(fileList ?? []);
+    if (files.length === 0) {
+      return;
+    }
+
+    const pdfFiles = files.filter((file) => file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'));
+    const imageFiles = files.filter((file) => isSupportedImage(file));
+    const fileName = getAiImportFileLabel(files);
+    const isLectureMode = aiImportTask === 'generate-from-lecture';
+    const safeLectureQuestionCount = Math.min(
+      MAX_LECTURE_QUESTION_COUNT,
+      Math.max(MIN_LECTURE_QUESTION_COUNT, Math.round(lectureQuestionCount) || 10),
+    );
+
+    if (pdfFiles.length > 0 && files.length > 1) {
+      setPdfExtraction({
+        status: 'error',
+        fileName,
+        message: 'Please upload either one PDF or image files, not both together.',
+      });
+      return;
+    }
+
+    if (pdfFiles.length === 0 && imageFiles.length !== files.length) {
+      setPdfExtraction({
+        status: 'error',
+        fileName,
+        message: 'Please upload a PDF, JPG, PNG, or WebP image file.',
+      });
+      return;
+    }
+
+    try {
+      setParseErrors([]);
+      let extracted: Awaited<ReturnType<typeof extractPdfForAi>> | Awaited<ReturnType<typeof extractImagesForAi>>;
+
+      if (pdfFiles.length === 1) {
+        const [file] = pdfFiles;
+        if (file.size > MAX_PDF_BYTES) {
+          throw new Error(`This PDF is too large. Please upload a file under ${Math.round(MAX_PDF_BYTES / 1024 / 1024)} MB.`);
+        }
+
+        setPdfExtraction({
+          status: 'extracting',
+          fileName,
+          message: isLectureMode
+            ? 'Reading the lecture PDF and checking whether it contains selectable text...'
+            : 'Reading the PDF and checking whether it contains selectable text...',
+        });
+        extracted = await extractPdfForAi(file);
+      } else {
+        setPdfExtraction({
+          status: 'extracting',
+          fileName,
+          message: isLectureMode
+            ? 'Preparing your lecture slide images for AI generation...'
+            : 'Preparing your paper image for AI extraction...',
+        });
+        extracted = await extractImagesForAi(imageFiles);
+      }
+
+      setPdfExtraction({
+        status: 'formatting',
+        fileName,
+        message: isLectureMode
+          ? `Generating ${safeLectureQuestionCount} MCQs from your lecture slides...`
+          : extracted.sourceType === 'text'
+            ? 'PDF text found. AI is formatting it into quiz-ready MCQs...'
+            : 'AI is reading the paper image and formatting quiz-ready MCQs...',
+      });
+
+      const response = await fetch('/api/extract-mcqs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task: aiImportTask,
+          questionCount: isLectureMode ? safeLectureQuestionCount : undefined,
+          fileName,
+          pageCount: extracted.pageCount,
+          sourceType: extracted.sourceType,
+          text: extracted.sourceType === 'text' ? extracted.text : undefined,
+          images: extracted.sourceType === 'images' ? extracted.images : undefined,
+        }),
+      });
+
+      const data = (await response.json().catch(() => null)) as { mcqText?: string; error?: string } | null;
+
+      if (response.status === 404) {
+        throw new Error('AI extraction API was not found. Locally, run the app with Vercel dev to test AI extraction.');
+      }
+
+      if (!response.ok) {
+        throw new Error(data?.error || 'AI extraction failed. Please try again.');
+      }
+
+      if (!data?.mcqText?.trim()) {
+        throw new Error('AI did not return any MCQs. Please try a clearer paper or paste the questions manually.');
+      }
+
+      const mcqText = data.mcqText.trim();
+      const parsed = parseQuestions(mcqText);
+      setPasteText(mcqText);
+      setParseErrors(parsed.errors);
+      setPdfExtraction({
+        status: parsed.errors.length > 0 ? 'error' : 'ready',
+        fileName,
+        message:
+          parsed.errors.length > 0
+            ? 'AI extracted text, but some questions need review. Fix the errors below before starting.'
+            : isLectureMode
+              ? `Ready to review. Generated ${parsed.questions.length} of ${safeLectureQuestionCount} requested MCQ${
+                  safeLectureQuestionCount === 1 ? '' : 's'
+                } from the slides.`
+              : `Ready to review. ${parsed.questions.length} question${parsed.questions.length === 1 ? '' : 's'} found.`,
+      });
+    } catch (error) {
+      setPdfExtraction({
+        status: 'error',
+        fileName,
+        message: error instanceof Error ? error.message : 'Could not extract MCQs from this paper file.',
+      });
+    } finally {
+      if (pdfInputRef.current) {
+        pdfInputRef.current.value = '';
+      }
+    }
   }
 
   function selectAnswer(option: OptionKey) {
@@ -981,6 +1321,324 @@ function App() {
     );
   }
 
+  function renderSetupDashboard() {
+    return (
+      <section className="setup-dashboard">
+        <div className="dashboard-main">
+          <div className="section-heading dashboard-heading">
+            <span className="step-label">Setup dashboard</span>
+            <h2>Build Your Practice Test</h2>
+            <p>Choose a source, review the MCQs, set the timer, and start when everything looks right.</p>
+          </div>
+
+          <section className="setup-card" aria-labelledby="source-title">
+            <div className="setup-card-heading">
+              <span className="step-number">1</span>
+              <div>
+                <h3 id="source-title">Choose Question Source</h3>
+                <p>Start from pasted MCQs, AI import, lecture slides, or a ChatGPT prompt.</p>
+              </div>
+            </div>
+
+            <div className="source-grid">
+              <button
+                className={`source-card ${questionSource === 'manual' ? 'selected' : ''}`}
+                type="button"
+                onClick={() => chooseQuestionSource('manual')}
+                aria-pressed={questionSource === 'manual'}
+              >
+                <strong>Paste MCQs Manually</strong>
+                <span>Use Q, A, B, C, D, ANSWER, and optional REASON labels.</span>
+              </button>
+              <button
+                className={`source-card ${questionSource === 'paper-ai' ? 'selected' : ''}`}
+                type="button"
+                onClick={() => chooseQuestionSource('paper-ai')}
+                aria-pressed={questionSource === 'paper-ai'}
+              >
+                <strong>Extract from Paper</strong>
+                <span>Upload a paper PDF, photo, or screenshot that already has MCQs.</span>
+              </button>
+              <button
+                className={`source-card ${questionSource === 'lecture-ai' ? 'selected' : ''}`}
+                type="button"
+                onClick={() => chooseQuestionSource('lecture-ai')}
+                aria-pressed={questionSource === 'lecture-ai'}
+              >
+                <strong>Generate from Slides</strong>
+                <span>Create MCQs only from uploaded lecture slides or images.</span>
+              </button>
+              <button
+                className={`source-card ${questionSource === 'chatgpt' ? 'selected' : ''}`}
+                type="button"
+                onClick={() => chooseQuestionSource('chatgpt')}
+                aria-pressed={questionSource === 'chatgpt'}
+              >
+                <strong>Use ChatGPT Prompt</strong>
+                <span>Copy a prompt, generate MCQs manually, then paste them here.</span>
+              </button>
+            </div>
+
+            {questionSource === 'manual' && (
+              <div className="source-panel">
+                <strong>Manual entry is selected.</strong>
+                <p>Paste formatted MCQs in the review box below, or load the built-in sample to see the format.</p>
+              </div>
+            )}
+
+            {(questionSource === 'paper-ai' || questionSource === 'lecture-ai') && (
+              <div className={`source-panel ai-source-panel ${pdfExtraction.status}`}>
+                <div className="source-panel-copy">
+                  <strong>
+                    {questionSource === 'lecture-ai' ? 'Generate MCQs from Lecture Slides' : 'Extract MCQs from Paper'}
+                  </strong>
+                  <p>
+                    {questionSource === 'lecture-ai'
+                      ? 'Upload lecture slides as a PDF or images. Gemini will use only the uploaded content.'
+                      : 'Upload a practice paper PDF, photo, or screenshot. Gemini will convert it to the app format.'}
+                  </p>
+                </div>
+
+                {questionSource === 'lecture-ai' && (
+                  <label className="lecture-count-field">
+                    <span>How many MCQs?</span>
+                    <input
+                      type="number"
+                      min={MIN_LECTURE_QUESTION_COUNT}
+                      max={MAX_LECTURE_QUESTION_COUNT}
+                      value={lectureQuestionCount}
+                      onChange={(event) => {
+                        const nextCount = Number(event.target.value);
+                        setLectureQuestionCount(
+                          Number.isFinite(nextCount)
+                            ? Math.min(MAX_LECTURE_QUESTION_COUNT, Math.max(MIN_LECTURE_QUESTION_COUNT, nextCount))
+                            : 10,
+                        );
+                      }}
+                    />
+                    <small>
+                      Choose {MIN_LECTURE_QUESTION_COUNT}-{MAX_LECTURE_QUESTION_COUNT}. Questions stay based on the
+                      uploaded slides.
+                    </small>
+                  </label>
+                )}
+
+                <input
+                  ref={pdfInputRef}
+                  className="pdf-file-input"
+                  id="paper-pdf"
+                  type="file"
+                  accept="application/pdf,.pdf,image/jpeg,image/png,image/webp"
+                  multiple
+                  onChange={(event) => {
+                    void handlePaperUpload(event.target.files);
+                  }}
+                />
+                <label className="pdf-upload-box compact" htmlFor="paper-pdf">
+                  <strong>Choose PDF or Images</strong>
+                  <span>{pdfExtraction.fileName || 'No file selected'}</span>
+                </label>
+                <p className="pdf-status" role={pdfExtraction.status === 'error' ? 'alert' : 'status'}>
+                  {pdfExtraction.message}
+                </p>
+              </div>
+            )}
+
+            {questionSource === 'chatgpt' && (
+              <details className="prompt-card dashboard-prompt" open>
+                <summary>
+                  <span>
+                    <strong>Generate MCQs with ChatGPT</strong>
+                    <small>Copy this prompt, generate MCQs, then paste the result into the review box.</small>
+                  </span>
+                </summary>
+                <div className="prompt-card-body">
+                  <textarea className="prompt-box" value={CHATGPT_PROMPT} readOnly rows={12} />
+                  <div className="prompt-actions">
+                    <button className="secondary-button" type="button" onClick={copyChatGptPrompt}>
+                      Copy Prompt
+                    </button>
+                    {promptCopyMessage && (
+                      <p className="copy-message" role="status">
+                        {promptCopyMessage}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </details>
+            )}
+          </section>
+
+          <section className="setup-card" aria-labelledby="review-title">
+            <div className="setup-card-heading">
+              <span className="step-number">2</span>
+              <div>
+                <h3 id="review-title">Review & Edit MCQs</h3>
+                <p>AI and sample output appears here first, so you can inspect it before starting.</p>
+              </div>
+              {hasQuestionInput && questionPreview.errors.length === 0 && (
+                <span className="detected-pill">{questionPreview.questions.length} detected</span>
+              )}
+            </div>
+
+            <textarea
+              className="question-input dashboard-question-input"
+              value={pasteText}
+              onChange={(event) => setPasteText(event.target.value)}
+              placeholder="Q: What is 25 percent of 240?&#10;A: 40&#10;B: 60&#10;C: 80&#10;D: 100&#10;ANSWER: B&#10;REASON: 25 percent means one-fourth. One-fourth of 240 is 60."
+              spellCheck={false}
+            />
+
+            {parseErrors.length > 0 && (
+              <div className="error-panel" role="alert">
+                <strong>Please fix these before starting:</strong>
+                <ul>
+                  {parseErrors.map((error) => (
+                    <li key={error}>{error}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>
+
+          <section className="timer-picker dashboard-timer-card" aria-labelledby="timer-picker-title">
+            <div className="setup-card-heading">
+              <span className="step-number">3</span>
+              <div className="timer-picker-heading">
+                <h3 id="timer-picker-title">Choose Timer</h3>
+                <p>Select per-question pressure or one full-test countdown.</p>
+              </div>
+            </div>
+
+            <div className="timer-mode-grid">
+              <article className={`timer-mode-card ${selectedTimerMode === 'per-question' ? 'selected' : ''}`}>
+                <button
+                  className="timer-mode-button"
+                  type="button"
+                  onClick={() => setSelectedTimerMode('per-question')}
+                  aria-pressed={selectedTimerMode === 'per-question'}
+                >
+                  {selectedTimerMode === 'per-question' && <span className="selected-badge">Selected</span>}
+                  <strong>Per Question Timer</strong>
+                  <span>Each question has its own time limit.</span>
+                </button>
+              </article>
+
+              <article className={`timer-mode-card ${selectedTimerMode === 'full-test' ? 'selected' : ''}`}>
+                <button
+                  className="timer-mode-button"
+                  type="button"
+                  onClick={() => setSelectedTimerMode('full-test')}
+                  aria-pressed={selectedTimerMode === 'full-test'}
+                >
+                  {selectedTimerMode === 'full-test' && <span className="selected-badge">Selected</span>}
+                  <strong>Full Test Timer</strong>
+                  <span>One timer controls the whole paper.</span>
+                </button>
+              </article>
+            </div>
+
+            <div className="timer-options-panel">
+              {selectedTimerMode === 'per-question' ? (
+                <>
+                  <div className="timer-options-heading">
+                    <strong>Per-question time</strong>
+                    <span>Timer resets whenever you open a question.</span>
+                  </div>
+                  <div className="timer-options">
+                    {PER_QUESTION_OPTIONS.map((seconds) => (
+                      <button
+                        className={`timer-chip ${selectedPerQuestionSeconds === seconds ? 'selected' : ''}`}
+                        type="button"
+                        key={seconds}
+                        onClick={() => setSelectedPerQuestionSeconds(seconds)}
+                        aria-pressed={selectedPerQuestionSeconds === seconds}
+                      >
+                        {seconds} sec
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="timer-options-heading">
+                    <strong>Full-test time</strong>
+                    <span>One countdown continues across every question.</span>
+                  </div>
+                  <div className="timer-options full-test-options">
+                    {FULL_TEST_OPTIONS.map((seconds) => (
+                      <button
+                        className={`timer-chip ${selectedFullTestSeconds === seconds ? 'selected' : ''}`}
+                        type="button"
+                        key={seconds}
+                        onClick={() => {
+                          setSelectedFullTestSeconds(seconds);
+                          setCustomFullTestMinutes(seconds / 60);
+                        }}
+                        aria-pressed={selectedFullTestSeconds === seconds}
+                      >
+                        {seconds / 60} min
+                      </button>
+                    ))}
+                    <label className="custom-timer active">
+                      <span>Custom minutes</span>
+                      <input
+                        type="number"
+                        min="1"
+                        max="240"
+                        value={customFullTestMinutes}
+                        onChange={(event) => {
+                          const minutes = Math.max(1, Number(event.target.value) || 1);
+                          setCustomFullTestMinutes(minutes);
+                          setSelectedFullTestSeconds(minutes * 60);
+                        }}
+                      />
+                    </label>
+                  </div>
+                </>
+              )}
+            </div>
+          </section>
+        </div>
+
+        <aside className="setup-summary" aria-label="Test setup summary">
+          <div className="setup-summary-card">
+            <span className="step-label">Step 4</span>
+            <h3>Start Test</h3>
+            <div className="summary-list">
+              <p>
+                <span>Source</span>
+                <strong>{getQuestionSourceLabel(questionSource)}</strong>
+              </p>
+              <p>
+                <span>Questions</span>
+                <strong>{hasQuestionInput ? questionPreview.questions.length : 0}</strong>
+              </p>
+              <p>
+                <span>Timer</span>
+                <strong>{selectedTimerLabel}</strong>
+              </p>
+              <p>
+                <span>Status</span>
+                <strong className={hasQuestionInput && questionPreview.errors.length === 0 ? 'summary-ready' : ''}>
+                  {validationLabel}
+                </strong>
+              </p>
+            </div>
+            <div className="summary-actions">
+              <button className="secondary-button" type="button" onClick={loadSampleQuestions}>
+                Load Sample Questions
+              </button>
+              <button className="primary-button" type="button" onClick={validateAndStart}>
+                Start Test
+              </button>
+            </div>
+          </div>
+        </aside>
+      </section>
+    );
+  }
+
   return (
     <main className="app-shell">
       <section className="app-frame" aria-live="polite">
@@ -1005,6 +1663,9 @@ function App() {
         </header>
 
         {screen === 'paste' && (
+          <>
+            {renderSetupDashboard()}
+            {false && (
           <section className="screen-stack">
             <div className="section-heading">
               <h2>Paste Questions</h2>
@@ -1035,6 +1696,103 @@ function App() {
                 </div>
               </div>
             </details>
+
+            <section className={`pdf-card ${pdfExtraction.status}`} aria-labelledby="pdf-upload-title">
+              <div className="pdf-card-copy">
+                <p className="eyebrow">AI import</p>
+                <h3 id="pdf-upload-title">Upload Paper or Lecture Slides</h3>
+                <p>
+                  Upload a practice paper, lecture PDF, slide photo, or screenshot. The app will place AI-created MCQs
+                  in the box below so you can review everything before starting.
+                </p>
+                <ul className="pdf-rules">
+                  <li>Supports normal PDFs, scanned PDFs, JPG, PNG, and WebP images.</li>
+                  <li>
+                    Maximum {MAX_PDF_PAGES} PDF pages or {MAX_IMAGE_FILES} images, up to{' '}
+                    {Math.round(MAX_PDF_BYTES / 1024 / 1024)} MB.
+                  </li>
+                  <li>AI output is always editable before the quiz starts.</li>
+                </ul>
+              </div>
+
+              <div className="pdf-upload-panel">
+                <div className="ai-import-mode" role="group" aria-label="AI import mode">
+                  <button
+                    className={`ai-import-mode-button ${aiImportTask === 'extract-paper' ? 'selected' : ''}`}
+                    type="button"
+                    onClick={() => {
+                      setAiImportTask('extract-paper');
+                      setPdfExtraction({
+                        status: 'idle',
+                        message: getAiImportIdleMessage('extract-paper'),
+                      });
+                    }}
+                    aria-pressed={aiImportTask === 'extract-paper'}
+                  >
+                    <strong>Extract MCQs from Paper</strong>
+                    <span>Use when the uploaded file already contains MCQs.</span>
+                  </button>
+                  <button
+                    className={`ai-import-mode-button ${aiImportTask === 'generate-from-lecture' ? 'selected' : ''}`}
+                    type="button"
+                    onClick={() => {
+                      setAiImportTask('generate-from-lecture');
+                      setPdfExtraction({
+                        status: 'idle',
+                        message: getAiImportIdleMessage('generate-from-lecture'),
+                      });
+                    }}
+                    aria-pressed={aiImportTask === 'generate-from-lecture'}
+                  >
+                    <strong>Generate MCQs from Lecture Slides</strong>
+                    <span>Create new questions only from uploaded slide content.</span>
+                  </button>
+                </div>
+
+                {aiImportTask === 'generate-from-lecture' && (
+                  <label className="lecture-count-field">
+                    <span>How many MCQs?</span>
+                    <input
+                      type="number"
+                      min={MIN_LECTURE_QUESTION_COUNT}
+                      max={MAX_LECTURE_QUESTION_COUNT}
+                      value={lectureQuestionCount}
+                      onChange={(event) => {
+                        const nextCount = Number(event.target.value);
+                        setLectureQuestionCount(
+                          Number.isFinite(nextCount)
+                            ? Math.min(MAX_LECTURE_QUESTION_COUNT, Math.max(MIN_LECTURE_QUESTION_COUNT, nextCount))
+                            : 10,
+                        );
+                      }}
+                    />
+                    <small>
+                      Choose {MIN_LECTURE_QUESTION_COUNT}-{MAX_LECTURE_QUESTION_COUNT}. Gemini will use only the uploaded
+                      slides.
+                    </small>
+                  </label>
+                )}
+
+                <input
+                  ref={pdfInputRef}
+                  className="pdf-file-input"
+                  id="paper-pdf"
+                  type="file"
+                  accept="application/pdf,.pdf,image/jpeg,image/png,image/webp"
+                  multiple
+                  onChange={(event) => {
+                    void handlePaperUpload(event.target.files);
+                  }}
+                />
+                <label className="pdf-upload-box" htmlFor="paper-pdf">
+                  <strong>Choose PDF or Images</strong>
+                  <span>{pdfExtraction.fileName || 'No file selected'}</span>
+                </label>
+                <p className="pdf-status" role={pdfExtraction.status === 'error' ? 'alert' : 'status'}>
+                  {pdfExtraction.message}
+                </p>
+              </div>
+            </section>
 
             <textarea
               className="question-input"
@@ -1160,6 +1918,8 @@ function App() {
               </button>
             </div>
           </section>
+            )}
+          </>
         )}
 
         {screen === 'quiz' && session && currentQuestion && (
