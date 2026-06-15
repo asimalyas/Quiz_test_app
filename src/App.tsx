@@ -5,6 +5,7 @@ type OptionKey = 'A' | 'B' | 'C' | 'D';
 type Screen = 'paste' | 'quiz' | 'results';
 type ReviewStatus = 'correct' | 'incorrect' | 'not-attempted';
 type ResultFilter = 'all' | ReviewStatus;
+type TimerMode = 'per-question' | 'full-test';
 
 type Question = {
   id: string;
@@ -24,16 +25,24 @@ type QuizSession = {
   questions: Question[];
   answers: Record<string, OptionKey>;
   timeSpent: Record<string, number>;
-  timePerQuestion: number;
+  timerMode: TimerMode;
+  perQuestionSeconds?: number;
+  fullTestSeconds?: number;
+  remainingFullTestSeconds?: number;
   currentIndex: number;
   questionStartedAt: number;
+  skippedQuestionIds: string[];
+  activeSkippedQuestionId?: string;
+  fullTestEndsAt?: number;
   completedAt?: number;
 };
 
 const STORAGE_KEY = 'entry-test-quiz-session';
 const LEGACY_STORAGE_KEY = 'hat-quick-quiz-session';
-const DEFAULT_TIME_PER_QUESTION = 60;
-const TIMER_OPTIONS = [30, 45, 60, 90, 120];
+const DEFAULT_PER_QUESTION_SECONDS = 60;
+const DEFAULT_FULL_TEST_SECONDS = 30 * 60;
+const PER_QUESTION_OPTIONS = [30, 45, 60, 90, 120];
+const FULL_TEST_OPTIONS = [5, 10, 15, 30, 45, 60].map((minutes) => minutes * 60);
 const NO_EXPLANATION_TEXT = 'No explanation was added for this question.';
 const CHATGPT_PROMPT = `Generate entry-test MCQs for the topic and number of questions that I provide.
 
@@ -231,19 +240,36 @@ function parseQuestions(input: string): ParseResult {
   return { questions, errors };
 }
 
-function normalizeSession(parsed: QuizSession): QuizSession | null {
+function normalizeSession(parsed: QuizSession & { timePerQuestion?: number }): QuizSession | null {
   if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) {
     return null;
   }
+
+  const timerMode = parsed.timerMode ?? 'per-question';
+  const perQuestionSeconds = parsed.perQuestionSeconds ?? parsed.timePerQuestion ?? DEFAULT_PER_QUESTION_SECONDS;
+  const fullTestSeconds = parsed.fullTestSeconds ?? DEFAULT_FULL_TEST_SECONDS;
+  const fullTestEndsAt =
+    parsed.fullTestEndsAt ??
+    (timerMode === 'full-test' ? Date.now() + (parsed.remainingFullTestSeconds ?? fullTestSeconds) * 1000 : undefined);
+  const remainingFullTestSeconds =
+    timerMode === 'full-test'
+      ? Math.max(0, Math.ceil(((fullTestEndsAt ?? Date.now()) - Date.now()) / 1000))
+      : undefined;
 
   return {
     screen: parsed.screen ?? 'paste',
     questions: parsed.questions,
     answers: parsed.answers ?? {},
     timeSpent: parsed.timeSpent ?? {},
-    timePerQuestion: parsed.timePerQuestion ?? DEFAULT_TIME_PER_QUESTION,
+    timerMode,
+    perQuestionSeconds,
+    fullTestSeconds,
+    remainingFullTestSeconds,
     currentIndex: parsed.currentIndex ?? 0,
     questionStartedAt: parsed.questionStartedAt ?? Date.now(),
+    skippedQuestionIds: parsed.skippedQuestionIds ?? [],
+    activeSkippedQuestionId: parsed.activeSkippedQuestionId,
+    fullTestEndsAt,
     completedAt: parsed.completedAt,
   };
 }
@@ -292,12 +318,48 @@ function getScore(questions: Question[], answers: Record<string, OptionKey>) {
   return { total, correct, wrong, unanswered, percentage };
 }
 
-function getElapsedSeconds(questionStartedAt: number, timePerQuestion: number, timestamp = Date.now()) {
-  return Math.min(timePerQuestion, Math.max(0, Math.ceil((timestamp - questionStartedAt) / 1000)));
+function getActiveQuestion(session: QuizSession) {
+  if (session.activeSkippedQuestionId) {
+    return session.questions.find((question) => question.id === session.activeSkippedQuestionId);
+  }
+
+  return session.questions[session.currentIndex];
+}
+
+function getQuestionPosition(questions: Question[], questionId?: string) {
+  const index = questions.findIndex((question) => question.id === questionId);
+  return index >= 0 ? index + 1 : 0;
+}
+
+function queueSkippedQuestion(queue: string[], questionId: string) {
+  return [...queue.filter((queuedQuestionId) => queuedQuestionId !== questionId), questionId];
+}
+
+function getElapsedSeconds(questionStartedAt: number, timestamp = Date.now(), limitSeconds?: number) {
+  const elapsed = Math.max(0, Math.ceil((timestamp - questionStartedAt) / 1000));
+  return typeof limitSeconds === 'number' ? Math.min(limitSeconds, elapsed) : elapsed;
 }
 
 function formatTimeSpent(seconds?: number) {
-  return `${Math.max(0, seconds ?? 0)} sec`;
+  const safeSeconds = Math.max(0, seconds ?? 0);
+  if (safeSeconds < 60) {
+    return `${safeSeconds} sec`;
+  }
+
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+  return `${minutes}m ${remainingSeconds.toString().padStart(2, '0')}s`;
+}
+
+function formatTimerClock(seconds: number) {
+  const safeSeconds = Math.max(0, seconds);
+  if (safeSeconds < 60) {
+    return `${safeSeconds}`;
+  }
+
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+  return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
 
 function getStatusLabel(status: ReviewStatus) {
@@ -316,26 +378,58 @@ function App() {
   const [pasteText, setPasteText] = useState('');
   const [parseErrors, setParseErrors] = useState<string[]>([]);
   const [promptCopyMessage, setPromptCopyMessage] = useState('');
-  const [selectedTimePerQuestion, setSelectedTimePerQuestion] = useState(DEFAULT_TIME_PER_QUESTION);
+  const [selectedTimerMode, setSelectedTimerMode] = useState<TimerMode>('per-question');
+  const [selectedPerQuestionSeconds, setSelectedPerQuestionSeconds] = useState(DEFAULT_PER_QUESTION_SECONDS);
+  const [selectedFullTestSeconds, setSelectedFullTestSeconds] = useState(DEFAULT_FULL_TEST_SECONDS);
+  const [customFullTestMinutes, setCustomFullTestMinutes] = useState(30);
   const [session, setSession] = useState<QuizSession | null>(() => loadSession());
   const [resultFilter, setResultFilter] = useState<ResultFilter>('all');
   const [timeEndedQuestionId, setTimeEndedQuestionId] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const autoAdvancedQuestionRef = useRef<string | null>(null);
   const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const fullTestSubmittedRef = useRef(false);
 
   const screen = session?.screen ?? 'paste';
-  const currentQuestion = session?.questions[session.currentIndex];
-  const timePerQuestion = session?.timePerQuestion ?? selectedTimePerQuestion;
+  const currentQuestion = session ? getActiveQuestion(session) : undefined;
+  const currentQuestionId = currentQuestion?.id;
+  const currentQuestionPosition = session ? getQuestionPosition(session.questions, currentQuestion?.id) : 0;
+  const perQuestionSeconds = session?.perQuestionSeconds ?? selectedPerQuestionSeconds;
+  const fullTestSeconds = session?.fullTestSeconds ?? selectedFullTestSeconds;
+  const fullTestRemaining = session?.remainingFullTestSeconds ?? fullTestSeconds;
+  const isFullTestMode = session?.timerMode === 'full-test';
+  const isPerQuestionMode = !session || session.timerMode === 'per-question';
   const elapsedSeconds =
-    session?.screen === 'quiz' ? Math.floor((now - session.questionStartedAt) / 1000) : 0;
-  const secondsLeft = Math.min(timePerQuestion, Math.max(0, timePerQuestion - elapsedSeconds));
-  const isFinalQuestion = session ? session.currentIndex === session.questions.length - 1 : false;
-  const isUrgent = screen === 'quiz' && secondsLeft > 0 && secondsLeft <= 10;
-  const timerProgress = timePerQuestion > 0 ? (secondsLeft / timePerQuestion) * 100 : 0;
+    session?.screen === 'quiz' && isPerQuestionMode ? Math.floor((now - session.questionStartedAt) / 1000) : 0;
+  const secondsLeft = Math.min(perQuestionSeconds, Math.max(0, perQuestionSeconds - elapsedSeconds));
+  const hasMoreAfterCurrent = session
+    ? Boolean(
+        session.activeSkippedQuestionId
+          ? session.skippedQuestionIds.length > 0
+          : session.currentIndex < session.questions.length - 1 || session.skippedQuestionIds.length > 0,
+      )
+    : false;
+  const isFinalQuestion = session ? !hasMoreAfterCurrent : false;
+  const skippedCount = session
+    ? session.skippedQuestionIds.length +
+      (session.activeSkippedQuestionId && !session.answers[session.activeSkippedQuestionId] ? 1 : 0)
+    : 0;
+  const answeredCount = session ? session.questions.filter((question) => session.answers[question.id]).length : 0;
+  const notAttemptedCount = session ? Math.max(0, session.questions.length - answeredCount - skippedCount) : 0;
+  const displaySeconds = isFullTestMode ? fullTestRemaining : secondsLeft;
+  const timerLimit = isFullTestMode ? fullTestSeconds : perQuestionSeconds;
+  const isUrgent =
+    screen === 'quiz' &&
+    displaySeconds > 0 &&
+    (isFullTestMode ? displaySeconds <= 60 : displaySeconds <= 10);
+  const timerProgress = timerLimit > 0 ? (displaySeconds / timerLimit) * 100 : 0;
   const timerStyle = { '--timer-progress': `${timerProgress}%` } as CSSProperties;
   const progressPercent = session
-    ? ((Math.min(session.currentIndex + (timePerQuestion - secondsLeft) / timePerQuestion, session.questions.length)) /
+    ? ((Math.min(
+        session.currentIndex +
+          (isPerQuestionMode ? (perQuestionSeconds - secondsLeft) / perQuestionSeconds : 0),
+        session.questions.length,
+      )) /
         session.questions.length) *
       100
     : 0;
@@ -384,7 +478,25 @@ function App() {
       return;
     }
 
-    const intervalId = window.setInterval(() => setNow(Date.now()), 250);
+    const intervalId = window.setInterval(() => {
+      const timestamp = Date.now();
+      setNow(timestamp);
+      setSession((previous) => {
+        if (!previous || previous.screen !== 'quiz' || previous.timerMode !== 'full-test') {
+          return previous;
+        }
+
+        const nextRemaining = Math.max(0, Math.ceil(((previous.fullTestEndsAt ?? timestamp) - timestamp) / 1000));
+        if (nextRemaining === previous.remainingFullTestSeconds) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          remainingFullTestSeconds: nextRemaining,
+        };
+      });
+    }, 250);
     return () => window.clearInterval(intervalId);
   }, [screen]);
 
@@ -397,7 +509,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!session || session.screen !== 'quiz') {
+    if (!session || session.screen !== 'quiz' || session.timerMode !== 'per-question') {
       return;
     }
 
@@ -420,27 +532,55 @@ function App() {
     }, 700);
   }, [secondsLeft, session]);
 
-  function startQuiz(questions: Question[], timeLimit = selectedTimePerQuestion) {
+  useEffect(() => {
+    if (!session || session.screen !== 'quiz' || session.timerMode !== 'full-test') {
+      return;
+    }
+
+    if ((session.remainingFullTestSeconds ?? 1) > 0 || fullTestSubmittedRef.current) {
+      return;
+    }
+
+    fullTestSubmittedRef.current = true;
+    submitTest(false);
+  }, [session]);
+
+  function startQuiz(
+    questions: Question[],
+    timerSettings = {
+      timerMode: selectedTimerMode,
+      perQuestionSeconds: selectedPerQuestionSeconds,
+      fullTestSeconds: selectedFullTestSeconds,
+    },
+  ) {
     if (autoAdvanceTimeoutRef.current) {
       window.clearTimeout(autoAdvanceTimeoutRef.current);
       autoAdvanceTimeoutRef.current = null;
     }
 
     const startedAt = Date.now();
+    const fullTestEndsAt =
+      timerSettings.timerMode === 'full-test' ? startedAt + timerSettings.fullTestSeconds * 1000 : undefined;
     const nextSession: QuizSession = {
       screen: 'quiz',
       questions,
       answers: { ...emptyAnswers },
       timeSpent: {},
-      timePerQuestion: timeLimit,
+      timerMode: timerSettings.timerMode,
+      perQuestionSeconds: timerSettings.timerMode === 'per-question' ? timerSettings.perQuestionSeconds : undefined,
+      fullTestSeconds: timerSettings.timerMode === 'full-test' ? timerSettings.fullTestSeconds : undefined,
+      remainingFullTestSeconds: timerSettings.timerMode === 'full-test' ? timerSettings.fullTestSeconds : undefined,
       currentIndex: 0,
       questionStartedAt: startedAt,
+      skippedQuestionIds: [],
+      fullTestEndsAt,
     };
     setNow(startedAt);
     setSession(nextSession);
     setResultFilter('all');
     setTimeEndedQuestionId(null);
     autoAdvancedQuestionRef.current = null;
+    fullTestSubmittedRef.current = false;
     setParseErrors([]);
   }
 
@@ -449,7 +589,7 @@ function App() {
     setParseErrors(result.errors);
 
     if (result.errors.length === 0) {
-      startQuiz(result.questions, selectedTimePerQuestion);
+      startQuiz(result.questions);
     }
   }
 
@@ -480,24 +620,37 @@ function App() {
       return;
     }
 
-    setSession({
-      ...session,
-      answers: {
-        ...session.answers,
-        [currentQuestion.id]: option,
-      },
+    setSession((previous) => {
+      if (!previous) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        answers: {
+          ...previous.answers,
+          [currentQuestion.id]: option,
+        },
+        skippedQuestionIds: previous.skippedQuestionIds.filter((questionId) => questionId !== currentQuestion.id),
+      };
     });
   }
 
   function addCurrentTimeSpent(previous: QuizSession, timestamp: number) {
-    const activeQuestion = previous.questions[previous.currentIndex];
+    const activeQuestion = getActiveQuestion(previous);
     if (!activeQuestion) {
       return previous.timeSpent;
     }
 
+    const visitSeconds = getElapsedSeconds(
+      previous.questionStartedAt,
+      timestamp,
+      previous.timerMode === 'per-question' ? previous.perQuestionSeconds : undefined,
+    );
+
     return {
       ...previous.timeSpent,
-      [activeQuestion.id]: getElapsedSeconds(previous.questionStartedAt, previous.timePerQuestion, timestamp),
+      [activeQuestion.id]: (previous.timeSpent[activeQuestion.id] ?? 0) + visitSeconds,
     };
   }
 
@@ -515,21 +668,44 @@ function App() {
       }
 
       const timeSpent = addCurrentTimeSpent(previous, nextStartedAt);
-      const nextIndex = previous.currentIndex + 1;
+      const activateSkipped = (queue: string[]) => {
+        const [nextSkippedQuestionId, ...remainingSkippedIds] = queue;
+        if (!nextSkippedQuestionId) {
+          return {
+            ...previous,
+            timeSpent,
+            activeSkippedQuestionId: undefined,
+            skippedQuestionIds: [],
+            screen: 'results' as const,
+            completedAt: nextStartedAt,
+          };
+        }
 
-      if (nextIndex >= previous.questions.length) {
         return {
           ...previous,
           timeSpent,
-          screen: 'results',
-          completedAt: nextStartedAt,
+          currentIndex: previous.questions.length,
+          activeSkippedQuestionId: nextSkippedQuestionId,
+          skippedQuestionIds: remainingSkippedIds,
+          questionStartedAt: nextStartedAt,
         };
+      };
+
+      if (previous.activeSkippedQuestionId) {
+        return activateSkipped(previous.skippedQuestionIds);
+      }
+
+      const nextIndex = previous.currentIndex + 1;
+
+      if (nextIndex >= previous.questions.length) {
+        return activateSkipped(previous.skippedQuestionIds);
       }
 
       return {
         ...previous,
         timeSpent,
         currentIndex: nextIndex,
+        activeSkippedQuestionId: undefined,
         questionStartedAt: nextStartedAt,
       };
     });
@@ -538,11 +714,119 @@ function App() {
     setNow(nextStartedAt);
   }
 
-  function finishTest() {
-    const confirmed = window.confirm('Finish the test now? Unanswered questions will be marked as not attempted.');
+  function skipQuestion() {
+    if (autoAdvanceTimeoutRef.current) {
+      window.clearTimeout(autoAdvanceTimeoutRef.current);
+      autoAdvanceTimeoutRef.current = null;
+    }
 
-    if (!confirmed) {
-      return;
+    const skippedAt = Date.now();
+
+    setSession((previous) => {
+      if (!previous || previous.screen !== 'quiz') {
+        return previous;
+      }
+
+      const activeQuestion = getActiveQuestion(previous);
+      if (!activeQuestion) {
+        return previous;
+      }
+
+      const timeSpent = addCurrentTimeSpent(previous, skippedAt);
+      const queuedSkippedIds = queueSkippedQuestion(previous.skippedQuestionIds, activeQuestion.id);
+
+      const activateSkipped = (queue: string[]) => {
+        const [nextSkippedQuestionId, ...remainingSkippedIds] = queue;
+        if (!nextSkippedQuestionId) {
+          return {
+            ...previous,
+            timeSpent,
+            activeSkippedQuestionId: undefined,
+            skippedQuestionIds: [],
+            screen: 'results' as const,
+            completedAt: skippedAt,
+          };
+        }
+
+        return {
+          ...previous,
+          timeSpent,
+          currentIndex: previous.questions.length,
+          activeSkippedQuestionId: nextSkippedQuestionId,
+          skippedQuestionIds: remainingSkippedIds,
+          questionStartedAt: skippedAt,
+        };
+      };
+
+      if (previous.activeSkippedQuestionId) {
+        return activateSkipped(queuedSkippedIds);
+      }
+
+      const nextIndex = previous.currentIndex + 1;
+      if (nextIndex >= previous.questions.length) {
+        return activateSkipped(queuedSkippedIds);
+      }
+
+      return {
+        ...previous,
+        timeSpent,
+        currentIndex: nextIndex,
+        skippedQuestionIds: queuedSkippedIds,
+        questionStartedAt: skippedAt,
+      };
+    });
+
+    setTimeEndedQuestionId(null);
+    setNow(skippedAt);
+  }
+
+  function jumpToQuestion(questionId: string) {
+    if (autoAdvanceTimeoutRef.current) {
+      window.clearTimeout(autoAdvanceTimeoutRef.current);
+      autoAdvanceTimeoutRef.current = null;
+    }
+
+    const jumpedAt = Date.now();
+
+    setSession((previous) => {
+      if (!previous || previous.screen !== 'quiz') {
+        return previous;
+      }
+
+      const targetIndex = previous.questions.findIndex((question) => question.id === questionId);
+      const activeQuestion = getActiveQuestion(previous);
+
+      if (targetIndex < 0 || activeQuestion?.id === questionId) {
+        return previous;
+      }
+
+      const activeSkippedQuestionId = previous.activeSkippedQuestionId;
+      const shouldRequeueActiveSkipped =
+        activeSkippedQuestionId && !previous.answers[activeSkippedQuestionId];
+
+      return {
+        ...previous,
+        timeSpent: addCurrentTimeSpent(previous, jumpedAt),
+        currentIndex: targetIndex,
+        activeSkippedQuestionId: undefined,
+        skippedQuestionIds: shouldRequeueActiveSkipped
+          ? queueSkippedQuestion(previous.skippedQuestionIds, activeSkippedQuestionId)
+          : previous.skippedQuestionIds,
+        questionStartedAt: jumpedAt,
+      };
+    });
+
+    setTimeEndedQuestionId(null);
+    setNow(jumpedAt);
+  }
+
+  function submitTest(shouldConfirm = true) {
+    if (shouldConfirm) {
+      const confirmed = window.confirm('Finish the test now? Unanswered questions will be marked as not attempted.');
+
+      if (!confirmed) {
+        return;
+      }
     }
 
     if (autoAdvanceTimeoutRef.current) {
@@ -556,12 +840,19 @@ function App() {
         ? {
             ...previous,
             timeSpent: previous.screen === 'quiz' ? addCurrentTimeSpent(previous, finishedAt) : previous.timeSpent,
+            remainingFullTestSeconds:
+              previous.timerMode === 'full-test' ? Math.max(0, previous.remainingFullTestSeconds ?? 0) : undefined,
             screen: 'results',
             completedAt: finishedAt,
           }
         : previous,
     );
+    setTimeEndedQuestionId(null);
     setResultFilter('all');
+  }
+
+  function finishTest() {
+    submitTest(true);
   }
 
   function startNewTest() {
@@ -576,6 +867,7 @@ function App() {
     setParseErrors([]);
     setTimeEndedQuestionId(null);
     setResultFilter('all');
+    fullTestSubmittedRef.current = false;
   }
 
   function retryWrongQuestions() {
@@ -593,19 +885,118 @@ function App() {
         ...question,
         id: makeQuestionId(index, question.prompt),
       })),
-      session.timePerQuestion,
+      {
+        timerMode: session.timerMode,
+        perQuestionSeconds: session.perQuestionSeconds ?? DEFAULT_PER_QUESTION_SECONDS,
+        fullTestSeconds: session.fullTestSeconds ?? DEFAULT_FULL_TEST_SECONDS,
+      },
+    );
+  }
+
+  function renderTimerCard(isMobile = false) {
+    return (
+      <section
+        className={`${isMobile ? 'mobile-timer-card' : 'timer-card'} ${isUrgent ? 'urgent' : ''}`}
+        aria-label="Quiz timer"
+        style={timerStyle}
+      >
+        <span className="timer-label">Time Left</span>
+        <strong className="timer-value" aria-label={`${formatTimerClock(displaySeconds)} remaining`}>
+          {isFullTestMode ? formatTimerClock(displaySeconds) : `${displaySeconds} sec`}
+        </strong>
+        <span className="timer-mode-label">{isFullTestMode ? 'Full Test Mode' : 'Per Question Mode'}</span>
+        <div className="timer-bar" aria-hidden="true">
+          <div className="timer-bar-fill" />
+        </div>
+        {isUrgent && (
+          <p className="timer-warning">
+            {isFullTestMode ? 'Hurry! Test time is almost over.' : 'Hurry! Select an answer.'}
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  function renderQuestionPalette(compact = false) {
+    if (!session) {
+      return null;
+    }
+
+    return (
+      <section className={`palette-card ${compact ? 'compact' : ''}`} aria-label="Question palette">
+        <div className="palette-heading">
+          <h3>Question Palette</h3>
+          <p>Jump to any question</p>
+        </div>
+        <div className="palette-counts">
+          <span>Answered: {answeredCount}</span>
+          <span>Skipped: {skippedCount}</span>
+          <span>Not Attempted: {notAttemptedCount}</span>
+        </div>
+        <nav className="question-navigator" aria-label="Question navigator">
+          <div className="question-circles">
+            {session.questions.map((question, index) => {
+              const isCurrent = question.id === currentQuestionId;
+              const isAnswered = Boolean(session.answers[question.id]);
+              const isSkipped =
+                session.skippedQuestionIds.includes(question.id) ||
+                (session.activeSkippedQuestionId === question.id && !isAnswered);
+
+              return (
+                <button
+                  className={`question-circle ${isCurrent ? 'current' : ''} ${isAnswered ? 'answered' : ''} ${
+                    isSkipped && !isAnswered ? 'skipped' : ''
+                  }`}
+                  type="button"
+                  key={question.id}
+                  onClick={() => jumpToQuestion(question.id)}
+                  aria-current={isCurrent ? 'step' : undefined}
+                  aria-label={`Open question ${index + 1}`}
+                >
+                  {index + 1}
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+        <div className="question-legend" aria-label="Question status legend">
+          <span>
+            <i className="legend-dot answered" />
+            Answered
+          </span>
+          <span>
+            <i className="legend-dot skipped" />
+            Skipped
+          </span>
+          <span>
+            <i className="legend-dot idle" />
+            Not Attempted
+          </span>
+          <span>
+            <i className="legend-dot current" />
+            Current
+          </span>
+        </div>
+      </section>
     );
   }
 
   return (
     <main className="app-shell">
       <section className="app-frame" aria-live="polite">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">Entry test practice</p>
-            <h1>Entry Test Quiz</h1>
-            <p className="app-subtitle">Paste your MCQs, practise under time pressure, and review your performance.</p>
-          </div>
+        <header className={screen === 'quiz' ? 'quiz-topbar' : 'topbar'}>
+          {screen === 'quiz' ? (
+            <div>
+              <strong>Quiz in Progress</strong>
+              <p>Stay focused and complete your attempt.</p>
+            </div>
+          ) : (
+            <div>
+              <p className="eyebrow">Entry test practice</p>
+              <h1>Entry Test Quiz</h1>
+              <p className="app-subtitle">Paste your MCQs, practise under time pressure, and review your performance.</p>
+            </div>
+          )}
           {session && (
             <button className="ghost-button" type="button" onClick={startNewTest}>
               New Test
@@ -618,8 +1009,8 @@ function App() {
             <div className="section-heading">
               <h2>Paste Questions</h2>
               <p>
-                Paste MCQs using Q, A, B, C, D, and ANSWER labels. REASON or EXPLANATION is optional. Choose the time
-                per question, then start your test.
+                Paste MCQs using Q, A, B, C, D, and ANSWER labels. REASON or EXPLANATION is optional. Choose a timer
+                mode, then start your test.
               </p>
             </div>
 
@@ -665,22 +1056,98 @@ function App() {
             )}
 
             <section className="timer-picker" aria-labelledby="timer-picker-title">
-              <div>
-                <h3 id="timer-picker-title">Time per Question</h3>
-                <p>Pick a pace before starting. The same timing is used for retries.</p>
+              <div className="timer-picker-heading">
+                <h3 id="timer-picker-title">Timer Mode</h3>
+                <p>Choose per-question pressure or one full-test countdown.</p>
               </div>
-              <div className="timer-options">
-                {TIMER_OPTIONS.map((seconds) => (
+
+              <div className="timer-mode-grid">
+                <article className={`timer-mode-card ${selectedTimerMode === 'per-question' ? 'selected' : ''}`}>
                   <button
-                    className={`timer-chip ${selectedTimePerQuestion === seconds ? 'selected' : ''}`}
+                    className="timer-mode-button"
                     type="button"
-                    key={seconds}
-                    onClick={() => setSelectedTimePerQuestion(seconds)}
-                    aria-pressed={selectedTimePerQuestion === seconds}
+                    onClick={() => setSelectedTimerMode('per-question')}
+                    aria-pressed={selectedTimerMode === 'per-question'}
                   >
-                    {seconds} sec
+                    {selectedTimerMode === 'per-question' && <span className="selected-badge">Selected</span>}
+                    <strong>Per Question Timer</strong>
+                    <span>Each question has its own time limit.</span>
                   </button>
-                ))}
+                </article>
+
+                <article className={`timer-mode-card ${selectedTimerMode === 'full-test' ? 'selected' : ''}`}>
+                  <button
+                    className="timer-mode-button"
+                    type="button"
+                    onClick={() => setSelectedTimerMode('full-test')}
+                    aria-pressed={selectedTimerMode === 'full-test'}
+                  >
+                    {selectedTimerMode === 'full-test' && <span className="selected-badge">Selected</span>}
+                    <strong>Full Test Timer</strong>
+                    <span>One timer controls the whole paper.</span>
+                  </button>
+                </article>
+              </div>
+
+              <div className="timer-options-panel">
+                {selectedTimerMode === 'per-question' ? (
+                  <>
+                    <div className="timer-options-heading">
+                      <strong>Per-question time</strong>
+                      <span>Timer resets whenever you open a question.</span>
+                    </div>
+                    <div className="timer-options">
+                      {PER_QUESTION_OPTIONS.map((seconds) => (
+                        <button
+                          className={`timer-chip ${selectedPerQuestionSeconds === seconds ? 'selected' : ''}`}
+                          type="button"
+                          key={seconds}
+                          onClick={() => setSelectedPerQuestionSeconds(seconds)}
+                          aria-pressed={selectedPerQuestionSeconds === seconds}
+                        >
+                          {seconds} sec
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="timer-options-heading">
+                      <strong>Full-test time</strong>
+                      <span>One countdown continues across every question.</span>
+                    </div>
+                    <div className="timer-options full-test-options">
+                      {FULL_TEST_OPTIONS.map((seconds) => (
+                        <button
+                          className={`timer-chip ${selectedFullTestSeconds === seconds ? 'selected' : ''}`}
+                          type="button"
+                          key={seconds}
+                          onClick={() => {
+                            setSelectedFullTestSeconds(seconds);
+                            setCustomFullTestMinutes(seconds / 60);
+                          }}
+                          aria-pressed={selectedFullTestSeconds === seconds}
+                        >
+                          {seconds / 60} min
+                        </button>
+                      ))}
+                      <label className="custom-timer active">
+                        <span>Custom minutes</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="240"
+                          value={customFullTestMinutes}
+                          onChange={(event) => {
+                            const minutes = Math.max(1, Number(event.target.value) || 1);
+                            setCustomFullTestMinutes(minutes);
+                            setSelectedFullTestSeconds(minutes * 60);
+                          }}
+                        />
+                      </label>
+                    </div>
+                  </>
+                )}
               </div>
             </section>
 
@@ -697,28 +1164,32 @@ function App() {
 
         {screen === 'quiz' && session && currentQuestion && (
           <section className="screen-stack quiz-layout">
-            <div className="quiz-meta">
+            <div className="quiz-main-grid">
+              <div className="quiz-main-column">
+                {renderTimerCard(true)}
+
+                <article className="question-card">
+                  <div className="question-card-header">
               <div>
-                <p className="eyebrow">
-                  Question {session.currentIndex + 1} of {session.questions.length}
+                <p className="question-kicker">
+                  Question {currentQuestionPosition} of {session.questions.length}
                 </p>
+                <span className="mode-badge">
+                  {session.timerMode === 'full-test' ? 'Full Test Mode' : 'Per Question Mode'}
+                </span>
                 <h2>{currentQuestion.prompt}</h2>
               </div>
-              <div
-                className={`timer ${secondsLeft <= 10 ? 'urgent' : ''}`}
-                style={timerStyle}
-                aria-label={`${secondsLeft} seconds left`}
-              >
-                <span>{secondsLeft}</span>
-                <small>sec</small>
-              </div>
+              <span className="skipped-pill">Skipped: {skippedCount}</span>
             </div>
 
-            {(isUrgent || timeEndedQuestionId === currentQuestion.id) && (
+            <details className="mobile-palette">
+              <summary>Question Palette</summary>
+              {renderQuestionPalette(true)}
+            </details>
+
+            {timeEndedQuestionId === currentQuestion.id && (
               <div className={`time-alert ${timeEndedQuestionId === currentQuestion.id ? 'ended' : ''}`} role="status">
-                {timeEndedQuestionId === currentQuestion.id
-                  ? 'Time ended. Moving to the next question...'
-                  : 'Hurry! Select an answer — time is running out.'}
+                Time ended. Moving to the next question...
               </div>
             )}
 
@@ -745,12 +1216,23 @@ function App() {
             </div>
 
             <div className="actions quiz-actions">
-              <button className="secondary-button finish-button" type="button" onClick={finishTest}>
+              <button className="finish-button" type="button" onClick={finishTest}>
                 Finish Test
+              </button>
+              <button className="secondary-button skip-button" type="button" onClick={skipQuestion}>
+                Skip
               </button>
               <button className="primary-button forward-button" type="button" onClick={() => goToNextQuestion()}>
                 {isFinalQuestion ? 'Submit Test' : 'Next Question'}
               </button>
+            </div>
+                </article>
+              </div>
+
+              <aside className="quiz-sidebar" aria-label="Quiz tools">
+                {renderTimerCard()}
+                {renderQuestionPalette()}
+              </aside>
             </div>
           </section>
         )}
@@ -835,6 +1317,9 @@ function App() {
                       </div>
 
                       <div className="answer-lines">
+                        <p>
+                          Status: <strong>{getStatusLabel(status)}</strong>
+                        </p>
                         <p>
                           Selected:{' '}
                           <strong>{selected ? `${selected}: ${question.options[selected]}` : 'No answer selected'}</strong>
