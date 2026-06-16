@@ -13,6 +13,8 @@ type TimerMode = 'per-question' | 'full-test';
 type AiImportTask = 'extract-paper' | 'generate-from-lecture';
 type QuestionSource = 'manual' | 'paper-ai' | 'lecture-ai' | 'chatgpt';
 type PdfExtractionStatus = 'idle' | 'extracting' | 'formatting' | 'ready' | 'error';
+type TutorRole = 'user' | 'assistant';
+type TutorStatus = 'idle' | 'thinking' | 'error';
 
 type Question = {
   id: string;
@@ -50,6 +52,19 @@ type PdfExtractionState = {
   fileName?: string;
 };
 
+type TutorMessage = {
+  id: string;
+  role: TutorRole;
+  text: string;
+};
+
+type TutorQuestionContext = {
+  question: Question;
+  index: number;
+  status: ReviewStatus;
+  selected?: OptionKey;
+};
+
 const STORAGE_KEY = 'entry-test-quiz-session';
 const LEGACY_STORAGE_KEY = 'hat-quick-quiz-session';
 const DEFAULT_PER_QUESTION_SECONDS = 60;
@@ -66,6 +81,13 @@ const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const PER_QUESTION_OPTIONS = [30, 45, 60, 90, 120];
 const FULL_TEST_OPTIONS = [5, 10, 15, 30, 45, 60].map((minutes) => minutes * 60);
 const NO_EXPLANATION_TEXT = 'No explanation was added for this question.';
+const TUTOR_QUICK_ACTIONS = [
+  'Give me a hint',
+  'Explain step by step',
+  'Why is my answer wrong?',
+  'Verify my reasoning',
+  'Give a similar example',
+];
 const CHATGPT_PROMPT = `Generate entry-test MCQs for the topic and number of questions that I provide.
 
 Use exactly this format:
@@ -539,6 +561,39 @@ function getQuestionSourceLabel(source: QuestionSource) {
   return 'Manual paste';
 }
 
+function makeTutorMessage(role: TutorRole, text: string): TutorMessage {
+  return {
+    id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    role,
+    text,
+  };
+}
+
+function renderTutorText(text: string) {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .split('\n')
+    .map((line, lineIndex) => {
+      const headingMatch = line.match(/^(\s*(?:\d+\.\s*)?[^:]{2,72}:)(\s.*)?$/);
+
+      if (headingMatch) {
+        return (
+          <span className="tutor-text-line" key={`${line}-${lineIndex}`}>
+            <strong className="tutor-line-heading">{headingMatch[1]}</strong>
+            {headingMatch[2] ?? ''}
+          </span>
+        );
+      }
+
+      return (
+        <span className="tutor-text-line" key={`${line}-${lineIndex}`}>
+          {line}
+        </span>
+      );
+    });
+}
+
 function App() {
   const [pasteText, setPasteText] = useState('');
   const [parseErrors, setParseErrors] = useState<string[]>([]);
@@ -556,6 +611,11 @@ function App() {
   const [customFullTestMinutes, setCustomFullTestMinutes] = useState(30);
   const [session, setSession] = useState<QuizSession | null>(() => loadSession());
   const [resultFilter, setResultFilter] = useState<ResultFilter>('all');
+  const [activeTutorQuestionId, setActiveTutorQuestionId] = useState<string | null>(null);
+  const [tutorMessagesByQuestionId, setTutorMessagesByQuestionId] = useState<Record<string, TutorMessage[]>>({});
+  const [tutorInput, setTutorInput] = useState('');
+  const [tutorStatus, setTutorStatus] = useState<TutorStatus>('idle');
+  const [tutorError, setTutorError] = useState('');
   const [timeEndedQuestionId, setTimeEndedQuestionId] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const autoAdvancedQuestionRef = useRef<string | null>(null);
@@ -651,6 +711,25 @@ function App() {
   }, [session]);
 
   const activeReviewItems = resultGroups[resultFilter];
+  const activeTutorContext = useMemo<TutorQuestionContext | null>(() => {
+    if (!session || !activeTutorQuestionId) {
+      return null;
+    }
+
+    const index = session.questions.findIndex((question) => question.id === activeTutorQuestionId);
+    if (index < 0) {
+      return null;
+    }
+
+    const question = session.questions[index];
+    return {
+      question,
+      index,
+      status: getReviewStatus(question, session.answers),
+      selected: session.answers[question.id],
+    };
+  }, [session, activeTutorQuestionId]);
+  const activeTutorMessages = activeTutorQuestionId ? tutorMessagesByQuestionId[activeTutorQuestionId] ?? [] : [];
 
   useEffect(() => {
     if (session) {
@@ -824,6 +903,80 @@ function App() {
     chooseQuestionSource('manual');
     setPasteText(sampleQuestions);
     setParseErrors([]);
+  }
+
+  function openTutor(questionId: string) {
+    setActiveTutorQuestionId(questionId);
+    setTutorInput('');
+    setTutorError('');
+    setTutorStatus('idle');
+  }
+
+  function closeTutor() {
+    setActiveTutorQuestionId(null);
+    setTutorInput('');
+    setTutorError('');
+    setTutorStatus('idle');
+  }
+
+  async function sendTutorMessage(messageText: string) {
+    const trimmedMessage = messageText.trim();
+    if (!trimmedMessage || !activeTutorContext || tutorStatus === 'thinking') {
+      return;
+    }
+
+    const questionId = activeTutorContext.question.id;
+    const userMessage = makeTutorMessage('user', trimmedMessage);
+    const previousMessages = tutorMessagesByQuestionId[questionId] ?? [];
+    const nextMessages = [...previousMessages, userMessage];
+
+    setTutorMessagesByQuestionId((previous) => ({
+      ...previous,
+      [questionId]: nextMessages,
+    }));
+    setTutorInput('');
+    setTutorError('');
+    setTutorStatus('thinking');
+
+    try {
+      const response = await fetch('/api/tutor-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: activeTutorContext.question.prompt,
+          options: activeTutorContext.question.options,
+          correctAnswer: activeTutorContext.question.answer,
+          selectedAnswer: activeTutorContext.selected,
+          status: activeTutorContext.status,
+          explanation: activeTutorContext.question.explanation,
+          userMessage: trimmedMessage,
+          messages: nextMessages.slice(-8).map(({ role, text }) => ({ role, text })),
+        }),
+      });
+
+      const data = (await response.json().catch(() => null)) as { reply?: string; error?: string } | null;
+
+      if (response.status === 404) {
+        throw new Error('AI Tutor API was not found. Locally, run the app with Vercel dev to use the tutor.');
+      }
+
+      if (!response.ok) {
+        throw new Error(data?.error || 'AI Tutor could not answer right now.');
+      }
+
+      const assistantMessage = makeTutorMessage(
+        'assistant',
+        data?.reply?.trim() || 'I could not form a helpful answer. Try asking in a simpler way.',
+      );
+      setTutorMessagesByQuestionId((previous) => ({
+        ...previous,
+        [questionId]: [...(previous[questionId] ?? nextMessages), assistantMessage],
+      }));
+      setTutorStatus('idle');
+    } catch (error) {
+      setTutorError(error instanceof Error ? error.message : 'AI Tutor could not answer right now.');
+      setTutorStatus('error');
+    }
   }
 
   async function handlePaperUpload(fileList: FileList | null) {
@@ -1207,6 +1360,11 @@ function App() {
     setParseErrors([]);
     setTimeEndedQuestionId(null);
     setResultFilter('all');
+    setActiveTutorQuestionId(null);
+    setTutorMessagesByQuestionId({});
+    setTutorInput('');
+    setTutorError('');
+    setTutorStatus('idle');
     fullTestSubmittedRef.current = false;
   }
 
@@ -1318,6 +1476,103 @@ function App() {
           </span>
         </div>
       </section>
+    );
+  }
+
+  function renderTutorDrawer() {
+    if (!activeTutorContext) {
+      return null;
+    }
+
+    const { question, index, status, selected } = activeTutorContext;
+
+    return (
+      <div className="tutor-overlay" role="dialog" aria-modal="true" aria-labelledby="tutor-title">
+        <section className="tutor-panel">
+          <div className="tutor-header">
+            <div>
+              <p className="eyebrow">AI Tutor</p>
+              <h2 id="tutor-title">Discuss This Question</h2>
+              <span>
+                Question {index + 1} · {getStatusLabel(status)}
+              </span>
+            </div>
+            <button className="ghost-button tutor-close" type="button" onClick={closeTutor} aria-label="Close AI Tutor">
+              Close
+            </button>
+          </div>
+
+          <div className="tutor-context">
+            <strong>{question.prompt}</strong>
+            <p>
+              Selected: {selected ? `${selected}: ${question.options[selected]}` : 'No answer selected'} · Correct:{' '}
+              {question.answer}: {question.options[question.answer]}
+            </p>
+          </div>
+
+          <div className="tutor-quick-actions" aria-label="AI Tutor quick actions">
+            {TUTOR_QUICK_ACTIONS.map((action) => (
+              <button
+                className="tutor-chip"
+                type="button"
+                key={action}
+                onClick={() => {
+                  void sendTutorMessage(action);
+                }}
+                disabled={tutorStatus === 'thinking'}
+              >
+                {action}
+              </button>
+            ))}
+          </div>
+
+          <div className="tutor-messages" aria-live="polite">
+            {activeTutorMessages.length === 0 ? (
+              <div className="tutor-empty">
+                <strong>Ask for a hint, steps, or answer verification.</strong>
+                <p>I will keep the answer short and focused on this question.</p>
+              </div>
+            ) : (
+              activeTutorMessages.map((message) => (
+                <div className={`tutor-message ${message.role}`} key={message.id}>
+                  <span className="tutor-speaker">{message.role === 'assistant' ? 'Tutor' : 'You'}</span>
+                  <p>{renderTutorText(message.text)}</p>
+                </div>
+              ))
+            )}
+            {tutorStatus === 'thinking' && (
+              <div className="tutor-message assistant">
+                <span className="tutor-speaker">Tutor</span>
+                <p>Thinking through the shortest helpful answer...</p>
+              </div>
+            )}
+          </div>
+
+          {tutorError && (
+            <div className="tutor-error" role="alert">
+              {tutorError}
+            </div>
+          )}
+
+          <form
+            className="tutor-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void sendTutorMessage(tutorInput);
+            }}
+          >
+            <textarea
+              value={tutorInput}
+              onChange={(event) => setTutorInput(event.target.value)}
+              placeholder="Ask your question or paste your reasoning..."
+              rows={3}
+            />
+            <button className="primary-button" type="submit" disabled={tutorStatus === 'thinking' || !tutorInput.trim()}>
+              Send
+            </button>
+          </form>
+        </section>
+      </div>
     );
   }
 
@@ -2059,7 +2314,12 @@ function App() {
                         <h3>
                           {index + 1}. {question.prompt}
                         </h3>
-                        <span className={`status-pill ${status}`}>{getStatusLabel(status)}</span>
+                        <div className="review-heading-actions">
+                          <span className={`status-pill ${status}`}>{getStatusLabel(status)}</span>
+                          <button className="tutor-open-button" type="button" onClick={() => openTutor(question.id)}>
+                            Ask AI Tutor
+                          </button>
+                        </div>
                       </div>
 
                       <div className="review-options">
@@ -2115,6 +2375,7 @@ function App() {
                 Retry Wrong Questions
               </button>
             </div>
+            {renderTutorDrawer()}
           </section>
         )}
       </section>
