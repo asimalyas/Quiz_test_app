@@ -4,7 +4,7 @@ A professional, responsive quiz practice app for university entry-test MCQs. It 
 
 **Live Demo:** [https://quiz-test-app-five.vercel.app/](https://quiz-test-app-five.vercel.app/)
 
-![Entry Test Quiz Dashboard](src/image.png)
+![Entry Test Quiz Dashboard](src/assets/dashboard.png)
 
 ---
 
@@ -214,12 +214,18 @@ The browser never sees the key. Only the Vercel API routes use it.
 |   |-- format-mcqs.ts
 |   `-- tutor-chat.ts
 |-- src/
-|   |-- App.css
 |   |-- App.tsx
-|   |-- asim-profile.png
-|   |-- image.png
+|   |-- assets/
+|   |   |-- asim-profile.png
+|   |   `-- dashboard.png
+|   |-- components/
+|   |-- features/
+|   |-- hooks/
 |   |-- index.css
+|   |-- lib/
 |   |-- main.tsx
+|   |-- styles/
+|   |-- types.ts
 |   `-- vite-env.d.ts
 |-- .env.example
 |-- .gitignore
@@ -253,7 +259,7 @@ This project includes a complete practice-test workflow:
 
 ## Author
 
-**Muhammad Asim Ilyas**
+**Muhammad Asim Ilyas Rathore**
 
 Creator of Entry Test Quiz, a student-focused practice tool designed to make MCQ preparation easier, faster, and more organized.
 

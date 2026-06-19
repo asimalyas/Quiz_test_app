@@ -1,0 +1,222 @@
+﻿@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.045);
+  }
+}
+
+@keyframes panelIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 980px) {
+  .setup-dashboard {
+    grid-template-columns: 1fr;
+  }
+
+  .setup-progress,
+  .source-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .setup-summary {
+    position: static;
+  }
+
+  .quiz-main-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .quiz-sidebar {
+    display: none;
+  }
+
+  .mobile-timer-card {
+    display: grid;
+    max-width: 360px;
+    justify-self: stretch;
+  }
+
+  .mobile-palette {
+    display: block;
+  }
+
+  .mobile-palette .palette-card {
+    border: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+    background: #ffffff;
+  }
+
+  .mobile-palette .question-circles {
+    max-height: 190px;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    padding: 14px;
+  }
+
+  .topbar,
+  .quiz-topbar,
+  .screen-stack,
+  .setup-dashboard {
+    padding: 20px;
+  }
+
+  .dashboard-command {
+    padding: 16px;
+  }
+
+  .setup-progress {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar,
+  .quiz-topbar,
+  .quiz-meta,
+  .question-card-header,
+  .tutor-header,
+  .review-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topbar-actions {
+    justify-content: stretch;
+  }
+
+  .about-overlay {
+    align-items: stretch;
+    padding: 14px;
+  }
+
+  .about-panel {
+    max-height: calc(100vh - 28px);
+    padding: 18px;
+  }
+
+  .about-close {
+    position: static;
+    justify-self: end;
+    order: -1;
+  }
+
+  .about-hero,
+  .about-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .about-hero {
+    padding-right: 0;
+  }
+
+  .about-photo-card {
+    max-width: 280px;
+    justify-self: center;
+    width: 100%;
+  }
+
+  .question-card {
+    padding: 18px;
+  }
+
+  .question-card h2 {
+    font-size: 1.12rem;
+  }
+
+  .options-grid,
+  .score-grid,
+  .source-grid,
+  .ai-source-panel,
+  .format-helper,
+  .pdf-card,
+  .timer-mode-grid,
+  .timer-options {
+    grid-template-columns: 1fr;
+  }
+
+  .setup-card,
+  .setup-summary-card {
+    padding: 16px;
+  }
+
+  .setup-card-heading {
+    align-items: flex-start;
+  }
+
+  .review-status-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .validation-badge {
+    width: fit-content;
+  }
+
+  .detected-pill {
+    margin-left: 0;
+  }
+
+  .review-heading-actions {
+    justify-content: flex-start;
+  }
+
+  .tutor-overlay {
+    align-items: stretch;
+  }
+
+  .tutor-panel {
+    width: 100%;
+    border-left: 0;
+    padding: 16px;
+  }
+
+  .tutor-message {
+    max-width: 94%;
+  }
+
+  .tab-button {
+    flex: 1 1 100%;
+  }
+
+  .quiz-actions,
+  .actions {
+    justify-content: stretch;
+  }
+
+  .quiz-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .primary-button,
+  .secondary-button,
+  .ghost-button,
+  .finish-button {
+    width: 100%;
+  }
+
+  .prompt-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .format-helper-actions {
+    justify-items: stretch;
+    min-width: 0;
+  }
+}
+
