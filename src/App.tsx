@@ -1,6 +1,7 @@
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
+import profileImageUrl from './asim-profile.png';
 import './App.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -13,6 +14,7 @@ type TimerMode = 'per-question' | 'full-test';
 type AiImportTask = 'extract-paper' | 'generate-from-lecture';
 type QuestionSource = 'manual' | 'paper-ai' | 'lecture-ai' | 'chatgpt';
 type PdfExtractionStatus = 'idle' | 'extracting' | 'formatting' | 'ready' | 'error';
+type AutoFormatStatus = 'idle' | 'formatting' | 'ready' | 'error';
 type TutorRole = 'user' | 'assistant';
 type TutorStatus = 'idle' | 'thinking' | 'error';
 
@@ -65,6 +67,14 @@ type TutorQuestionContext = {
   selected?: OptionKey;
 };
 
+type AutoFormatState = {
+  status: AutoFormatStatus;
+  message: string;
+  sourceText?: string;
+  formattedText?: string;
+};
+
+const PROFILE_IMAGE_SRC = profileImageUrl;
 const STORAGE_KEY = 'entry-test-quiz-session';
 const LEGACY_STORAGE_KEY = 'hat-quick-quiz-session';
 const DEFAULT_PER_QUESTION_SECONDS = 60;
@@ -77,6 +87,7 @@ const MAX_IMAGE_LONG_EDGE = 1600;
 const MIN_TEXT_EXTRACTION_CHARS = 120;
 const MIN_LECTURE_QUESTION_COUNT = 5;
 const MAX_LECTURE_QUESTION_COUNT = 50;
+const MAX_AUTO_FORMAT_CHARS = 60_000;
 const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const PER_QUESTION_OPTIONS = [30, 45, 60, 90, 120];
 const FULL_TEST_OPTIONS = [5, 10, 15, 30, 45, 60].map((minutes) => minutes * 60);
@@ -605,6 +616,10 @@ function App() {
     status: 'idle',
     message: getAiImportIdleMessage('extract-paper'),
   });
+  const [autoFormat, setAutoFormat] = useState<AutoFormatState>({
+    status: 'idle',
+    message: '',
+  });
   const [selectedTimerMode, setSelectedTimerMode] = useState<TimerMode>('per-question');
   const [selectedPerQuestionSeconds, setSelectedPerQuestionSeconds] = useState(DEFAULT_PER_QUESTION_SECONDS);
   const [selectedFullTestSeconds, setSelectedFullTestSeconds] = useState(DEFAULT_FULL_TEST_SECONDS);
@@ -617,6 +632,8 @@ function App() {
   const [tutorStatus, setTutorStatus] = useState<TutorStatus>('idle');
   const [tutorError, setTutorError] = useState('');
   const [timeEndedQuestionId, setTimeEndedQuestionId] = useState<string | null>(null);
+  const [isAboutOpen, setIsAboutOpen] = useState(false);
+  const [profileImageFailed, setProfileImageFailed] = useState(false);
   const [now, setNow] = useState(Date.now());
   const autoAdvancedQuestionRef = useRef<string | null>(null);
   const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
@@ -669,6 +686,7 @@ function App() {
 
   const questionPreview = useMemo(() => parseQuestions(pasteText), [pasteText]);
   const hasQuestionInput = pasteText.trim().length > 0;
+  const showAutoFormatSuggestion = hasQuestionInput && questionPreview.errors.length > 0;
   const validationLabel = !hasQuestionInput
     ? 'Waiting for questions'
     : questionPreview.errors.length === 0
@@ -857,6 +875,106 @@ function App() {
     }
   }
 
+  function handleQuestionInputChange(value: string) {
+    setPasteText(value);
+    setAutoFormat((previous) =>
+      previous.status === 'idle'
+        ? previous
+        : {
+            status: 'idle',
+            message: '',
+          },
+    );
+  }
+
+  async function handleAutoFormatMcqs() {
+    const sourceText = pasteText.trim();
+
+    if (!sourceText) {
+      setAutoFormat({
+        status: 'error',
+        message: 'Paste your questions first, then use Auto Format MCQs.',
+      });
+      return;
+    }
+
+    if (sourceText.length > MAX_AUTO_FORMAT_CHARS) {
+      setAutoFormat({
+        status: 'error',
+        message: `This paste is too large for one auto-format request. Please keep it under ${Math.round(
+          MAX_AUTO_FORMAT_CHARS / 1000,
+        )}k characters or split it into smaller parts.`,
+      });
+      return;
+    }
+
+    if (autoFormat.sourceText === sourceText && autoFormat.formattedText) {
+      const cachedText = autoFormat.formattedText;
+      const parsed = parseQuestions(cachedText);
+      setPasteText(cachedText);
+      setParseErrors(parsed.errors);
+      setAutoFormat({
+        status: parsed.errors.length === 0 ? 'ready' : 'error',
+        sourceText,
+        formattedText: cachedText,
+        message:
+          parsed.errors.length === 0
+            ? 'Reused the previous formatted version. Review it, then start your test.'
+            : 'Reused the previous formatted version, but a few items still need review.',
+      });
+      return;
+    }
+
+    setAutoFormat({
+      status: 'formatting',
+      message: 'Formatting your pasted MCQs...',
+    });
+
+    try {
+      const response = await fetch('/api/format-mcqs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text: sourceText }),
+      });
+      const data = (await response.json()) as { mcqText?: string; error?: string };
+
+      if (!response.ok) {
+        const setupHint =
+          response.status === 404
+            ? ' Run with npx vercel dev for local AI formatting, or use the deployed Vercel site.'
+            : '';
+        throw new Error(`${data.error || 'Auto Format could not repair this paste.'}${setupHint}`);
+      }
+
+      const formattedText = (data.mcqText || '').trim();
+      if (!formattedText) {
+        throw new Error('Auto Format did not return any MCQs. Please try with clearer question text.');
+      }
+
+      const parsed = parseQuestions(formattedText);
+      setPasteText(formattedText);
+      setParseErrors(parsed.errors);
+      setAutoFormat({
+        status: parsed.errors.length === 0 ? 'ready' : 'error',
+        sourceText,
+        formattedText,
+        message:
+          parsed.errors.length === 0
+            ? `Auto Format repaired the paste and detected ${parsed.questions.length} question${
+                parsed.questions.length === 1 ? '' : 's'
+              }. Review them before starting.`
+            : 'Auto Format improved the paste, but some questions still need manual review.',
+      });
+    } catch (error) {
+      setAutoFormat({
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Auto Format could not repair this paste.',
+      });
+    }
+  }
+
   async function copyChatGptPrompt() {
     try {
       if (!navigator.clipboard) {
@@ -903,6 +1021,10 @@ function App() {
     chooseQuestionSource('manual');
     setPasteText(sampleQuestions);
     setParseErrors([]);
+    setAutoFormat({
+      status: 'idle',
+      message: '',
+    });
   }
 
   function openTutor(questionId: string) {
@@ -1358,6 +1480,10 @@ function App() {
     saveSession(null);
     setPasteText('');
     setParseErrors([]);
+    setAutoFormat({
+      status: 'idle',
+      message: '',
+    });
     setTimeEndedQuestionId(null);
     setResultFilter('all');
     setActiveTutorQuestionId(null);
@@ -1576,14 +1702,149 @@ function App() {
     );
   }
 
+  function renderAboutModal() {
+    if (!isAboutOpen) {
+      return null;
+    }
+
+    return (
+      <div className="about-overlay" role="dialog" aria-modal="true" aria-labelledby="about-title">
+        <section className="about-panel">
+          <button
+            className="ghost-button about-close"
+            type="button"
+            onClick={() => setIsAboutOpen(false)}
+            aria-label="Close About Me"
+          >
+            Close
+          </button>
+
+          <div className="about-hero">
+            <div className="about-photo-card">
+              {profileImageFailed ? (
+                <div className="about-photo-fallback" aria-label="Muhammad Asim Ilyas profile initials">
+                  MA
+                </div>
+              ) : (
+                <img
+                  src={PROFILE_IMAGE_SRC}
+                  alt="Muhammad Asim Ilyas"
+                  onError={() => setProfileImageFailed(true)}
+                />
+              )}
+            </div>
+
+            <div className="about-intro">
+              <p className="eyebrow">Creator Profile</p>
+              <h2 id="about-title">Muhammad Asim Ilyas</h2>
+              <p>
+                Creator of Entry Test Quiz, built to help students practise university-entry MCQs with clearer feedback,
+                realistic timing, and focused review.
+              </p>
+              <div className="about-tags" aria-label="Profile highlights">
+                <span>Entry test practice</span>
+                <span>AI-assisted learning</span>
+                <span>Student-focused tools</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="about-grid">
+            <article className="about-card featured">
+              <span>Purpose</span>
+              <h3>Make practice feel simple, serious, and useful.</h3>
+              <p>
+                This app is designed for students preparing for tests like HAT, NTS, GAT, FAST, NUST, COMSATS, and other
+                university entry exams.
+              </p>
+            </article>
+
+            <article className="about-card">
+              <span>Motivation</span>
+              <p>
+                Many students have MCQs in PDFs, notes, screenshots, or rough text. Entry Test Quiz turns that material
+                into a clean practice workflow: import, review, attempt, and learn from mistakes.
+              </p>
+            </article>
+
+            <article className="about-card">
+              <span>What this project offers</span>
+              <ul>
+                <li>Manual MCQ paste with validation.</li>
+                <li>AI paper and lecture-slide import.</li>
+                <li>Timed quiz modes with skip and question palette.</li>
+                <li>Results review with explanations and AI Tutor help.</li>
+              </ul>
+            </article>
+
+            <article className="about-card">
+              <span>Design promise</span>
+              <p>
+                The goal is a clean, student-friendly tool: fewer distractions, visible progress, helpful recovery from
+                errors, and enough structure to practise with confidence.
+              </p>
+            </article>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   function renderSetupDashboard() {
+    const questionsReady = hasQuestionInput && questionPreview.errors.length === 0;
+    const questionsNeedFix = hasQuestionInput && questionPreview.errors.length > 0;
+    const setupSteps = [
+      {
+        number: '1',
+        label: 'Source',
+        detail: getQuestionSourceLabel(questionSource),
+        status: 'complete',
+      },
+      {
+        number: '2',
+        label: 'Questions',
+        detail: questionsReady
+          ? `${questionPreview.questions.length} ready`
+          : questionsNeedFix
+            ? `${questionPreview.errors.length} to fix`
+            : 'Add MCQs',
+        status: questionsReady ? 'complete' : questionsNeedFix ? 'attention' : 'active',
+      },
+      {
+        number: '3',
+        label: 'Timer',
+        detail: selectedTimerLabel,
+        status: 'complete',
+      },
+      {
+        number: '4',
+        label: 'Start',
+        detail: questionsReady ? 'Ready' : 'Waiting',
+        status: questionsReady ? 'active' : 'locked',
+      },
+    ];
+
     return (
       <section className="setup-dashboard">
         <div className="dashboard-main">
-          <div className="section-heading dashboard-heading">
-            <span className="step-label">Setup dashboard</span>
-            <h2>Build Your Practice Test</h2>
-            <p>Choose a source, review the MCQs, set the timer, and start when everything looks right.</p>
+          <div className="dashboard-command">
+            <div className="section-heading dashboard-heading">
+              <span className="step-label">Setup dashboard</span>
+              <h2>Build Your Practice Test</h2>
+              <p>Choose a source, review the questions, set the timer, then start with confidence.</p>
+            </div>
+
+            <div className="setup-progress" aria-label="Test setup progress">
+              {setupSteps.map((step) => (
+                <div className={`setup-progress-item ${step.status}`} key={step.number}>
+                  <span className="setup-progress-number">{step.number}</span>
+                  <span>
+                    <strong>{step.label}</strong>
+                    <small>{step.detail}</small>
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
 
           <section className="setup-card" aria-labelledby="source-title">
@@ -1602,6 +1863,10 @@ function App() {
                 onClick={() => chooseQuestionSource('manual')}
                 aria-pressed={questionSource === 'manual'}
               >
+                <span className="source-card-top">
+                  <span className="source-icon">PA</span>
+                  {questionSource === 'manual' && <span className="source-selected">Selected</span>}
+                </span>
                 <strong>Paste MCQs Manually</strong>
                 <span>Use Q, A, B, C, D, ANSWER, and optional REASON labels.</span>
               </button>
@@ -1611,6 +1876,10 @@ function App() {
                 onClick={() => chooseQuestionSource('paper-ai')}
                 aria-pressed={questionSource === 'paper-ai'}
               >
+                <span className="source-card-top">
+                  <span className="source-icon">AI</span>
+                  {questionSource === 'paper-ai' && <span className="source-selected">Selected</span>}
+                </span>
                 <strong>Extract from Paper</strong>
                 <span>Upload a paper PDF, photo, or screenshot that already has MCQs.</span>
               </button>
@@ -1620,6 +1889,10 @@ function App() {
                 onClick={() => chooseQuestionSource('lecture-ai')}
                 aria-pressed={questionSource === 'lecture-ai'}
               >
+                <span className="source-card-top">
+                  <span className="source-icon">SL</span>
+                  {questionSource === 'lecture-ai' && <span className="source-selected">Selected</span>}
+                </span>
                 <strong>Generate from Slides</strong>
                 <span>Create MCQs only from uploaded lecture slides or images.</span>
               </button>
@@ -1629,6 +1902,10 @@ function App() {
                 onClick={() => chooseQuestionSource('chatgpt')}
                 aria-pressed={questionSource === 'chatgpt'}
               >
+                <span className="source-card-top">
+                  <span className="source-icon">GP</span>
+                  {questionSource === 'chatgpt' && <span className="source-selected">Selected</span>}
+                </span>
                 <strong>Use ChatGPT Prompt</strong>
                 <span>Copy a prompt, generate MCQs manually, then paste them here.</span>
               </button>
@@ -1736,13 +2013,56 @@ function App() {
               )}
             </div>
 
+            <div className={`review-status-row ${questionsReady ? 'ready' : questionsNeedFix ? 'attention' : ''}`}>
+              <div>
+                <strong>Question workspace</strong>
+                <span>Paste or review MCQs here. The app validates this box before the quiz begins.</span>
+              </div>
+              <span className="validation-badge">{validationLabel}</span>
+            </div>
+
             <textarea
               className="question-input dashboard-question-input"
               value={pasteText}
-              onChange={(event) => setPasteText(event.target.value)}
+              onChange={(event) => handleQuestionInputChange(event.target.value)}
               placeholder="Q: What is 25 percent of 240?&#10;A: 40&#10;B: 60&#10;C: 80&#10;D: 100&#10;ANSWER: B&#10;REASON: 25 percent means one-fourth. One-fourth of 240 is 60."
               spellCheck={false}
             />
+
+            {showAutoFormatSuggestion && (
+              <div className={`format-helper ${autoFormat.status}`} role="region" aria-label="Auto format helper">
+                <div className="format-helper-copy">
+                  <strong>Format needs attention</strong>
+                  <p>
+                    If your text came from ChatGPT, notes, or a copied paper, Auto Format can clean numbering,
+                    markdown, option labels, answer labels, and extra intro text into the quiz format.
+                  </p>
+                </div>
+                <div className="format-helper-actions">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => {
+                      void handleAutoFormatMcqs();
+                    }}
+                    disabled={autoFormat.status === 'formatting'}
+                  >
+                    {autoFormat.status === 'formatting' ? 'Formatting...' : 'Auto Format MCQs'}
+                  </button>
+                  {autoFormat.message && (
+                    <p className="format-status" role={autoFormat.status === 'error' ? 'alert' : 'status'}>
+                      {autoFormat.message}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {!showAutoFormatSuggestion && autoFormat.message && (
+              <p className={`format-status standalone ${autoFormat.status}`} role="status">
+                {autoFormat.message}
+              </p>
+            )}
 
             {parseErrors.length > 0 && (
               <div className="error-panel" role="alert">
@@ -1910,11 +2230,16 @@ function App() {
               <p className="app-subtitle">Paste your MCQs, practise under time pressure, and review your performance.</p>
             </div>
           )}
-          {session && (
-            <button className="ghost-button" type="button" onClick={startNewTest}>
-              New Test
+          <div className="topbar-actions">
+            <button className="secondary-button about-trigger" type="button" onClick={() => setIsAboutOpen(true)}>
+              About Me
             </button>
-          )}
+            {session && (
+              <button className="ghost-button" type="button" onClick={startNewTest}>
+                New Test
+              </button>
+            )}
+          </div>
         </header>
 
         {screen === 'paste' && (
@@ -2378,6 +2703,7 @@ function App() {
             {renderTutorDrawer()}
           </section>
         )}
+        {renderAboutModal()}
       </section>
     </main>
   );
