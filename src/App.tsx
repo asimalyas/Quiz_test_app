@@ -1,4 +1,4 @@
-import { type CSSProperties, useMemo, useRef, useState } from 'react';
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react';
 import './styles/index.css';
 import { AboutModal } from './components/AboutModal';
 import { AppHeader } from './components/AppHeader';
@@ -14,7 +14,22 @@ import type { AiImportTask, QuestionSource, TimerMode } from './types';
 import { CHATGPT_PROMPT, DEFAULT_FULL_TEST_SECONDS, DEFAULT_PER_QUESTION_SECONDS, sampleQuestions } from './lib/constants';
 import { getAiImportIdleMessage } from './lib/labels';
 import { parseQuestions } from './lib/parser';
+
+type ThemeMode = 'light' | 'dark';
+
+const THEME_STORAGE_KEY = 'entry-test-quiz-theme';
+
+function getInitialTheme(): ThemeMode {
+  if (typeof window === 'undefined') {
+    return 'light';
+  }
+
+  const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+  return storedTheme === 'dark' || storedTheme === 'light' ? storedTheme : 'light';
+}
+
 function App() {
+  const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
   const [pasteText, setPasteText] = useState('');
   const [parseErrors, setParseErrors] = useState<string[]>([]);
   const [promptCopyMessage, setPromptCopyMessage] = useState('');
@@ -98,6 +113,16 @@ function App() {
       ? `${selectedPerQuestionSeconds} sec per question`
       : `${Math.round(selectedFullTestSeconds / 60)} min full test`;
 
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    document.documentElement.style.colorScheme = themeMode;
+    window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+  }, [themeMode]);
+
+  function toggleTheme() {
+    setThemeMode((currentTheme) => (currentTheme === 'dark' ? 'light' : 'dark'));
+  }
+
   function validateAndStart() {
     const result = parseQuestions(pasteText);
     setParseErrors(result.errors);
@@ -164,11 +189,13 @@ function App() {
     resetTutor();
   }
   return (
-    <main className="app-shell">
+    <main className="app-shell" data-theme={themeMode}>
       <section className="app-frame" aria-live="polite">
         <AppHeader
           screen={screen}
           hasSession={Boolean(session)}
+          themeMode={themeMode}
+          onToggleTheme={toggleTheme}
           onNewTest={startNewTest}
           onOpenAbout={() => setIsAboutOpen(true)}
         />

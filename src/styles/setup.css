@@ -1,4 +1,4 @@
-﻿.setup-dashboard {
+.setup-dashboard {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
   gap: 24px;
@@ -954,7 +954,7 @@
 }
 
 .selected-badge::before {
-  content: "âœ“";
+  content: none;
   margin-right: 5px;
 }
 

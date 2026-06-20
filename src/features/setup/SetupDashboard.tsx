@@ -80,11 +80,49 @@ export function SetupDashboard({
 }: SetupDashboardProps) {
   const questionsReady = hasQuestionInput && questionPreview.errors.length === 0;
   const questionsNeedFix = hasQuestionInput && questionPreview.errors.length > 0;
+  const detectedQuestionCount = hasQuestionInput ? questionPreview.questions.length : 0;
+  const issueCount = questionPreview.errors.length;
+  const sourceLabel = getQuestionSourceLabel(questionSource);
+  const launchButtonLabel = questionsReady ? 'Start Test' : 'Check Questions';
+  const nextAction = questionsReady
+    ? 'Everything is ready. Start the test whenever you feel prepared.'
+    : questionsNeedFix
+      ? 'Clean the format issues below, then the test will unlock cleanly.'
+      : 'Choose a source, add your MCQs, and the dashboard will guide you forward.';
+  const workspaceQuality = questionsReady ? 'Ready to launch' : questionsNeedFix ? 'Needs attention' : 'Not started';
+  const timerValue =
+    selectedTimerMode === 'per-question' ? `${selectedPerQuestionSeconds}s` : `${Math.round(selectedFullTestSeconds / 60)}m`;
+  const dashboardMetrics = [
+    {
+      label: 'Questions',
+      value: detectedQuestionCount,
+      detail: questionsReady ? 'validated MCQs' : hasQuestionInput ? 'parsed so far' : 'waiting for input',
+      tone: questionsReady ? 'ready' : 'idle',
+    },
+    {
+      label: 'Format issues',
+      value: issueCount,
+      detail: issueCount === 0 ? 'clean workspace' : 'fix before launch',
+      tone: issueCount === 0 ? 'ready' : 'attention',
+    },
+    {
+      label: 'Timer',
+      value: timerValue,
+      detail: selectedTimerMode === 'per-question' ? 'per question mode' : 'full test mode',
+      tone: 'accent',
+    },
+    {
+      label: 'Source',
+      value: questionSource === 'manual' ? 'Manual' : questionSource === 'chatgpt' ? 'GPT' : 'AI',
+      detail: sourceLabel,
+      tone: 'source',
+    },
+  ];
   const setupSteps = [
     {
       number: '1',
       label: 'Source',
-      detail: getQuestionSourceLabel(questionSource),
+      detail: sourceLabel,
       status: 'complete',
     },
     {
@@ -113,22 +151,84 @@ export function SetupDashboard({
 
   return (
     <section className="setup-dashboard">
+      <aside className="setup-summary" aria-label="Test setup summary">
+        <div className="setup-profile-card">
+          <span className="setup-profile-mark">QS</span>
+          <span>
+            <strong>Quiz Studio</strong>
+            <small>Entry test command center</small>
+          </span>
+        </div>
+
+        <nav className="setup-progress" aria-label="Test setup progress">
+          {setupSteps.map((step) => (
+            <div className={`setup-progress-item ${step.status}`} key={step.number}>
+              <span className="setup-progress-number">{step.number}</span>
+              <span>
+                <strong>{step.label}</strong>
+                <small>{step.detail}</small>
+              </span>
+            </div>
+          ))}
+        </nav>
+
+        <div className="quick-start-card">
+          <span className="step-label">Quick start</span>
+          <p>New here? Load the sample, see the format, then replace it with your own MCQs.</p>
+        </div>
+
+        <div className="setup-summary-card">
+          <span className="step-label">Launch panel</span>
+          <h3>Launch checklist</h3>
+          <div className="summary-list">
+            <p>
+              <span>Source</span>
+              <strong>{sourceLabel}</strong>
+            </p>
+            <p>
+              <span>Questions</span>
+              <strong>{detectedQuestionCount}</strong>
+            </p>
+            <p>
+              <span>Timer</span>
+              <strong>{selectedTimerLabel}</strong>
+            </p>
+            <p>
+              <span>Status</span>
+              <strong className={questionsReady ? 'summary-ready' : ''}>{validationLabel}</strong>
+            </p>
+          </div>
+          <div className="summary-actions">
+            <button className="secondary-button" type="button" onClick={onLoadSampleQuestions}>
+              Load Sample Questions
+            </button>
+            <button className="primary-button" type="button" onClick={onValidateAndStart}>
+              {launchButtonLabel}
+            </button>
+          </div>
+        </div>
+      </aside>
+
       <div className="dashboard-main">
         <div className="dashboard-command">
-          <div className="section-heading dashboard-heading">
-            <span className="step-label">Setup dashboard</span>
-            <h2>Build Your Practice Test</h2>
-            <p>Choose a source, review the questions, set the timer, then start with confidence.</p>
+          <div className="section-heading dashboard-heading dashboard-command-copy">
+            <span className="dashboard-chip">Practice command center</span>
+            <h2>Build a calm, exam-ready quiz session.</h2>
+            <p>
+              Bring in your MCQs, review the format, set the pace, and start with a workspace that feels simple and clear.
+            </p>
+            <div className="dashboard-guidance" role="status">
+              <span>{workspaceQuality}</span>
+              <strong>{nextAction}</strong>
+            </div>
           </div>
 
-          <div className="setup-progress" aria-label="Test setup progress">
-            {setupSteps.map((step) => (
-              <div className={`setup-progress-item ${step.status}`} key={step.number}>
-                <span className="setup-progress-number">{step.number}</span>
-                <span>
-                  <strong>{step.label}</strong>
-                  <small>{step.detail}</small>
-                </span>
+          <div className="dashboard-kpi-grid" aria-label="Quiz setup metrics">
+            {dashboardMetrics.map((metric) => (
+              <div className={`dashboard-kpi ${metric.tone}`} key={metric.label}>
+                <span>{metric.label}</span>
+                <strong>{metric.value}</strong>
+                <small>{metric.detail}</small>
               </div>
             ))}
           </div>
@@ -138,8 +238,8 @@ export function SetupDashboard({
           <div className="setup-card-heading">
             <span className="step-number">1</span>
             <div>
-              <h3 id="source-title">Choose Question Source</h3>
-              <p>Start from pasted MCQs, AI import, lecture slides, or a ChatGPT prompt.</p>
+              <h3 id="source-title">Choose how to add questions</h3>
+              <p>Pick the easiest path for your material. You can review everything before starting.</p>
             </div>
           </div>
 
@@ -154,8 +254,8 @@ export function SetupDashboard({
                 <span className="source-icon">PA</span>
                 {questionSource === 'manual' && <span className="source-selected">Selected</span>}
               </span>
-              <strong>Paste MCQs Manually</strong>
-              <span>Use Q, A, B, C, D, ANSWER, and optional REASON labels.</span>
+              <strong>Paste Ready MCQs</strong>
+              <span>Best when your questions already include options and answer labels.</span>
             </button>
             <button
               className={`source-card ${questionSource === 'paper-ai' ? 'selected' : ''}`}
@@ -167,8 +267,8 @@ export function SetupDashboard({
                 <span className="source-icon">AI</span>
                 {questionSource === 'paper-ai' && <span className="source-selected">Selected</span>}
               </span>
-              <strong>Extract from Paper</strong>
-              <span>Upload a paper PDF, photo, or screenshot that already has MCQs.</span>
+              <strong>Import Paper</strong>
+              <span>Upload a PDF, photo, or screenshot and let AI prepare the MCQs.</span>
             </button>
             <button
               className={`source-card ${questionSource === 'lecture-ai' ? 'selected' : ''}`}
@@ -180,8 +280,8 @@ export function SetupDashboard({
                 <span className="source-icon">SL</span>
                 {questionSource === 'lecture-ai' && <span className="source-selected">Selected</span>}
               </span>
-              <strong>Generate from Slides</strong>
-              <span>Create MCQs only from uploaded lecture slides or images.</span>
+              <strong>Use Lecture Slides</strong>
+              <span>Create focused MCQs from your own slides or lecture images.</span>
             </button>
             <button
               className={`source-card ${questionSource === 'chatgpt' ? 'selected' : ''}`}
@@ -193,15 +293,15 @@ export function SetupDashboard({
                 <span className="source-icon">GP</span>
                 {questionSource === 'chatgpt' && <span className="source-selected">Selected</span>}
               </span>
-              <strong>Use ChatGPT Prompt</strong>
-              <span>Copy a prompt, generate MCQs manually, then paste them here.</span>
+              <strong>Use Prompt</strong>
+              <span>Copy the ready prompt, generate questions, and paste them back here.</span>
             </button>
           </div>
 
           {questionSource === 'manual' && (
             <div className="source-panel">
-              <strong>Manual entry is selected.</strong>
-              <p>Paste formatted MCQs in the review box below, or load the built-in sample to see the format.</p>
+              <strong>Paste mode is ready.</strong>
+              <p>Add your MCQs in the workspace below, or load the sample to see the exact format.</p>
             </div>
           )}
 
@@ -209,7 +309,7 @@ export function SetupDashboard({
             <div className={`source-panel ai-source-panel ${pdfExtraction.status}`}>
               <div className="source-panel-copy">
                 <strong>
-                  {questionSource === 'lecture-ai' ? 'Generate MCQs from Lecture Slides' : 'Extract MCQs from Paper'}
+                  {questionSource === 'lecture-ai' ? 'Create questions from slides' : 'Turn a paper into MCQs'}
                 </strong>
                 <p>
                   {questionSource === 'lecture-ai'
@@ -220,7 +320,7 @@ export function SetupDashboard({
 
               {questionSource === 'lecture-ai' && (
                 <label className="lecture-count-field">
-                  <span>How many MCQs?</span>
+                  <span>Question target</span>
                   <input
                     type="number"
                     min={MIN_LECTURE_QUESTION_COUNT}
@@ -236,8 +336,7 @@ export function SetupDashboard({
                     }}
                   />
                   <small>
-                    Choose {MIN_LECTURE_QUESTION_COUNT}-{MAX_LECTURE_QUESTION_COUNT}. Questions stay based on the
-                    uploaded slides.
+                    Choose {MIN_LECTURE_QUESTION_COUNT}-{MAX_LECTURE_QUESTION_COUNT} questions. AI will only use your uploaded slides.
                   </small>
                 </label>
               )}
@@ -252,8 +351,8 @@ export function SetupDashboard({
                 onChange={(event) => onPaperUpload(event.target.files)}
               />
               <label className="pdf-upload-box compact" htmlFor="paper-pdf">
-                <strong>Choose PDF or Images</strong>
-                <span>{pdfExtraction.fileName || 'No file selected'}</span>
+                <strong>Upload files</strong>
+                <span>{pdfExtraction.fileName || 'PDF, PNG, JPG, or WebP'}</span>
               </label>
               <p className="pdf-status" role={pdfExtraction.status === 'error' ? 'alert' : 'status'}>
                 {pdfExtraction.message}
@@ -265,8 +364,8 @@ export function SetupDashboard({
             <details className="prompt-card dashboard-prompt" open>
               <summary>
                 <span>
-                  <strong>Generate MCQs with ChatGPT</strong>
-                  <small>Copy this prompt, generate MCQs, then paste the result into the review box.</small>
+                  <strong>Use a ready prompt</strong>
+                  <small>Copy the prompt, generate MCQs, then paste the result into the workspace.</small>
                 </span>
               </summary>
               <div className="prompt-card-body">
@@ -290,8 +389,8 @@ export function SetupDashboard({
           <div className="setup-card-heading">
             <span className="step-number">2</span>
             <div>
-              <h3 id="review-title">Review & Edit MCQs</h3>
-              <p>AI and sample output appears here first, so you can inspect it before starting.</p>
+              <h3 id="review-title">Question workspace</h3>
+              <p>Paste, review, and fix questions here. The app checks the format before launch.</p>
             </div>
             {hasQuestionInput && questionPreview.errors.length === 0 && (
               <span className="detected-pill">{questionPreview.questions.length} detected</span>
@@ -300,8 +399,8 @@ export function SetupDashboard({
 
           <div className={`review-status-row ${questionsReady ? 'ready' : questionsNeedFix ? 'attention' : ''}`}>
             <div>
-              <strong>Question workspace</strong>
-              <span>Paste or review MCQs here. The app validates this box before the quiz begins.</span>
+              <strong>Format check</strong>
+              <span>The app checks your questions here before the quiz begins.</span>
             </div>
             <span className="validation-badge">{validationLabel}</span>
           </div>
@@ -363,8 +462,8 @@ export function SetupDashboard({
           <div className="setup-card-heading">
             <span className="step-number">3</span>
             <div className="timer-picker-heading">
-              <h3 id="timer-picker-title">Choose Timer</h3>
-              <p>Select per-question pressure or one full-test countdown.</p>
+              <h3 id="timer-picker-title">Timer and pace</h3>
+              <p>Choose a focused sprint or a full exam-style countdown.</p>
             </div>
           </div>
 
@@ -459,40 +558,6 @@ export function SetupDashboard({
         </section>
       </div>
 
-      <aside className="setup-summary" aria-label="Test setup summary">
-        <div className="setup-summary-card">
-          <span className="step-label">Step 4</span>
-          <h3>Start Test</h3>
-          <div className="summary-list">
-            <p>
-              <span>Source</span>
-              <strong>{getQuestionSourceLabel(questionSource)}</strong>
-            </p>
-            <p>
-              <span>Questions</span>
-              <strong>{hasQuestionInput ? questionPreview.questions.length : 0}</strong>
-            </p>
-            <p>
-              <span>Timer</span>
-              <strong>{selectedTimerLabel}</strong>
-            </p>
-            <p>
-              <span>Status</span>
-              <strong className={hasQuestionInput && questionPreview.errors.length === 0 ? 'summary-ready' : ''}>
-                {validationLabel}
-              </strong>
-            </p>
-          </div>
-          <div className="summary-actions">
-            <button className="secondary-button" type="button" onClick={onLoadSampleQuestions}>
-              Load Sample Questions
-            </button>
-            <button className="primary-button" type="button" onClick={onValidateAndStart}>
-              Start Test
-            </button>
-          </div>
-        </div>
-      </aside>
     </section>
   );
 }
